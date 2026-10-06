@@ -1,0 +1,22 @@
+#version 460
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Src {
+    uvec4 src[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer Dst {
+    uvec4 dst[];
+};
+layout(push_constant) uniform Push { uint units; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.units) {
+        uint base = i * 4u;
+        uvec4 k = uvec4(0x9e3779b9u);
+        dst[base + 0u] = src[base + 0u] ^ k;
+        dst[base + 1u] = src[base + 1u] ^ k;
+        dst[base + 2u] = src[base + 2u] ^ k;
+        dst[base + 3u] = src[base + 3u] ^ k;
+    }
+}

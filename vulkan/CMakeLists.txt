@@ -12,7 +12,6 @@ find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 function(jr_compile_shader target_name shader_name)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader_name}")
     set(out "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader_name}.spv")
-
     add_custom_command(
         OUTPUT "${out}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
@@ -31,6 +30,10 @@ endfunction()
 
 jr_compile_shader(jr_vk_vector_shader vector_add.comp)
 jr_compile_shader(jr_vk_host_copy_shader host_copy.comp)
+jr_compile_shader(jr_vk_read_scalar_shader host_read_scalar.comp)
+jr_compile_shader(jr_vk_read_vec4_shader host_read_vec4.comp)
+jr_compile_shader(jr_vk_read_u2_shader host_read_uvec4x2.comp)
+jr_compile_shader(jr_vk_read_u4_shader host_read_uvec4x4.comp)
 
 add_library(jr_vk_runtime STATIC
     src/vk_context.cpp
@@ -39,30 +42,36 @@ add_library(jr_vk_runtime STATIC
 target_include_directories(jr_vk_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
-
 target_link_libraries(jr_vk_runtime PUBLIC Vulkan::Vulkan)
+target_compile_options(jr_vk_runtime PRIVATE -Wall -Wextra -Wpedantic)
 
-target_compile_options(jr_vk_runtime PRIVATE
-    -Wall -Wextra -Wpedantic
-)
-
-add_executable(jr-vk-v0
-    src/main.cpp
-)
+add_executable(jr-vk-v0 src/main.cpp)
 add_dependencies(jr-vk-v0 jr_vk_vector_shader)
 target_link_libraries(jr-vk-v0 PRIVATE jr_vk_runtime)
 target_compile_definitions(jr-vk-v0 PRIVATE
     JR_VK_VECTOR_SHADER="${jr_vk_vector_shader_SPV}"
 )
 
-add_executable(jr-vk-memprobe
-    src/memprobe.cpp
-)
+add_executable(jr-vk-memprobe src/memprobe.cpp)
 add_dependencies(jr-vk-memprobe jr_vk_host_copy_shader)
 target_link_libraries(jr-vk-memprobe PRIVATE jr_vk_runtime)
 target_compile_definitions(jr-vk-memprobe PRIVATE
     JR_VK_HOST_COPY_SHADER="${jr_vk_host_copy_shader_SPV}"
 )
-target_compile_options(jr-vk-memprobe PRIVATE
-    -Wall -Wextra -Wpedantic
+target_compile_options(jr-vk-memprobe PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(jr-vk-memprobe-v04 src/memprobe_v04.cpp)
+add_dependencies(jr-vk-memprobe-v04
+    jr_vk_read_scalar_shader
+    jr_vk_read_vec4_shader
+    jr_vk_read_u2_shader
+    jr_vk_read_u4_shader
 )
+target_link_libraries(jr-vk-memprobe-v04 PRIVATE jr_vk_runtime)
+target_compile_definitions(jr-vk-memprobe-v04 PRIVATE
+    JR_VK_READ_SCALAR_SHADER="${jr_vk_read_scalar_shader_SPV}"
+    JR_VK_READ_VEC4_SHADER="${jr_vk_read_vec4_shader_SPV}"
+    JR_VK_READ_U2_SHADER="${jr_vk_read_u2_shader_SPV}"
+    JR_VK_READ_U4_SHADER="${jr_vk_read_u4_shader_SPV}"
+)
+target_compile_options(jr-vk-memprobe-v04 PRIVATE -Wall -Wextra -Wpedantic)
