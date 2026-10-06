@@ -41,6 +41,10 @@ jr_compile_shader(jr_vk_expert_dequant_shader expert_dequant.comp)
 jr_compile_shader(jr_vk_expert_gemv_shader expert_gemv.comp)
 jr_compile_shader(jr_vk_expert_swiglu_shader expert_swiglu.comp)
 jr_compile_shader(jr_vk_fused_gemv_shader fused_expert_gemv.comp)
+jr_compile_shader(jr_vk_q8_quant_shader q8_1_quant.comp)
+jr_compile_shader(jr_vk_swiglu_q8_shader swiglu_q8_1.comp)
+jr_compile_shader(jr_vk_q8_gemv_shader fused_q8_expert_gemv.comp)
+jr_compile_shader(jr_vk_weighted_accum_shader weighted_accum.comp)
 
 add_library(jr_vk_runtime STATIC
     src/vk_context.cpp
@@ -133,3 +137,30 @@ target_compile_definitions(jr-vk-fused-expert PRIVATE
     JR_VK_EXPERT_SWIGLU_SHADER="${jr_vk_expert_swiglu_shader_SPV}"
 )
 target_compile_options(jr-vk-fused-expert PRIVATE -Wall -Wextra -Wpedantic)
+
+
+# V4: routed expert engine.
+# The routing decision is an input contract, matching Strata native_expert_grouped:
+# selected expert IDs + normalized route weights are already known.
+# V4 executes top-10 experts across mixed VRAM/imported-RAM tiers, with q8_1
+# activations and weighted accumulation.
+add_executable(jr-vk-routed-expert
+    src/routed_expert.cpp
+)
+add_dependencies(jr-vk-routed-expert
+    jr_vk_q8_quant_shader
+    jr_vk_swiglu_q8_shader
+    jr_vk_q8_gemv_shader
+    jr_vk_weighted_accum_shader
+)
+target_link_libraries(jr-vk-routed-expert PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-routed-expert PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-routed-expert PRIVATE
+    JR_VK_Q8_QUANT_SHADER="${jr_vk_q8_quant_shader_SPV}"
+    JR_VK_SWIGLU_Q8_SHADER="${jr_vk_swiglu_q8_shader_SPV}"
+    JR_VK_Q8_GEMV_SHADER="${jr_vk_q8_gemv_shader_SPV}"
+    JR_VK_WEIGHTED_ACCUM_SHADER="${jr_vk_weighted_accum_shader_SPV}"
+)
+target_compile_options(jr-vk-routed-expert PRIVATE -Wall -Wextra -Wpedantic)

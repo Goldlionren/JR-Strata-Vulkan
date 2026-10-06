@@ -1,0 +1,79 @@
+#version 460
+
+// Strata-shaped q8_1 activation quantization.
+//
+// Output layout is exactly 36 bytes / 32 values:
+//   word 0    : fp16 d | fp16 sum
+//   words 1-8 : 32 signed int8 quants, four packed per uint32
+//
+// q = round-away-from-zero(x / d), clamped to [-127,127]
+// d = min(amax/127, 65504), with q using the pre-fp16 d.
+// The stored d/sum are fp16, matching block_q8_1.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Src {
+    float src[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer Q8 {
+    uint q8[];
+};
+
+layout(push_constant) uniform Push {
+    uint n;
+} pc;
+
+shared float red_abs[32];
+shared float red_sum[32];
+shared int q_shared[32];
+
+float finite_half(float v) {
+    return clamp(v, -65504.0, 65504.0);
+}
+
+int quant_away(float x, float d, float amax) {
+    if (amax == 0.0) return 0;
+    float z = x / d;
+    float qf = sign(z) * floor(abs(z) + 0.5);
+    qf = clamp(qf, -127.0, 127.0);
+    return int(qf);
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint i = block * 32u + lane;
+
+    float v = i < pc.n ? src[i] : 0.0;
+    red_abs[lane] = abs(v);
+    red_sum[lane] = v;
+    barrier();
+
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red_abs[lane] = max(red_abs[lane], red_abs[lane + s]);
+            red_sum[lane] += red_sum[lane + s];
+        }
+        barrier();
+    }
+
+    float amax = red_abs[0];
+    float d = min(amax / 127.0, 65504.0);
+    q_shared[lane] = quant_away(v, d, amax);
+    barrier();
+
+    uint base = block * 9u;
+    if (lane == 0u) {
+        q8[base] = packHalf2x16(vec2(finite_half(d), finite_half(red_sum[0])));
+    }
+
+    if (lane < 8u) {
+        uint k = lane * 4u;
+        uint w =
+            (uint(q_shared[k + 0u]) & 0xffu) |
+            ((uint(q_shared[k + 1u]) & 0xffu) << 8u) |
+            ((uint(q_shared[k + 2u]) & 0xffu) << 16u) |
+            ((uint(q_shared[k + 3u]) & 0xffu) << 24u);
+        q8[base + 1u + lane] = w;
+    }
+}
