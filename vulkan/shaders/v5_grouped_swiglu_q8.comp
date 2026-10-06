@@ -1,0 +1,82 @@
+#version 460
+
+// All selected experts in one dispatch.
+// group x = q8 block inside n_ff; group y = route rank.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer GateUp {
+    float gu[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer HiddenQ8 {
+    uint q8[];
+};
+
+layout(push_constant) uniform Push {
+    uint k;
+    uint n_ff;
+} pc;
+
+shared float red_abs[32];
+shared float red_sum[32];
+shared int q_shared[32];
+
+float finite_half(float v) {
+    return clamp(v, -65504.0, 65504.0);
+}
+
+int quant_away(float x, float d, float amax) {
+    if (amax == 0.0) return 0;
+    float z = x / d;
+    float qf = sign(z) * floor(abs(z) + 0.5);
+    qf = clamp(qf, -127.0, 127.0);
+    return int(qf);
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    uint rank = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+    if (rank >= pc.k) return;
+
+    uint i = block * 32u + lane;
+    float h = 0.0;
+    if (i < pc.n_ff) {
+        uint base = rank * (2u * pc.n_ff);
+        float g = gu[base + i];
+        float u = gu[base + pc.n_ff + i];
+        h = (g / (1.0 + exp(-g))) * u;
+    }
+
+    red_abs[lane] = abs(h);
+    red_sum[lane] = h;
+    barrier();
+
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            red_abs[lane] = max(red_abs[lane], red_abs[lane + s]);
+            red_sum[lane] += red_sum[lane + s];
+        }
+        barrier();
+    }
+
+    float amax = red_abs[0];
+    float d = min(amax / 127.0, 65504.0);
+    q_shared[lane] = quant_away(h, d, amax);
+    barrier();
+
+    uint expert_words = (pc.n_ff / 32u) * 9u;
+    uint base = rank * expert_words + block * 9u;
+
+    if (lane == 0u) {
+        q8[base] = packHalf2x16(vec2(finite_half(d), finite_half(red_sum[0])));
+    }
+    if (lane < 8u) {
+        uint q0 = lane * 4u;
+        q8[base + 1u + lane] =
+            (uint(q_shared[q0 + 0u]) & 0xffu) |
+            ((uint(q_shared[q0 + 1u]) & 0xffu) << 8u) |
+            ((uint(q_shared[q0 + 2u]) & 0xffu) << 16u) |
+            ((uint(q_shared[q0 + 3u]) & 0xffu) << 24u);
+    }
+}

@@ -1,0 +1,29 @@
+#version 460
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Parts {
+    float parts[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer RouteWeights {
+    float weights[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer Output {
+    float output_vec[];
+};
+
+layout(push_constant) uniform Push {
+    uint k;
+    uint n_embd;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_embd) return;
+
+    float s = parts[i] * weights[0];
+    for (uint r = 1u; r < pc.k; ++r) {
+        s += parts[r * pc.n_embd + i] * weights[r];
+    }
+    output_vec[i] = s;
+}

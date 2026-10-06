@@ -85,10 +85,10 @@ Context::~Context() {
 
 void Context::create_instance() {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "JR-Strata-Vulkan V0";
-    app.applicationVersion = VK_MAKE_VERSION(0, 0, 1);
+    app.pApplicationName = "JR-Strata-Vulkan";
+    app.applicationVersion = VK_MAKE_VERSION(0, 6, 0);
     app.pEngineName = "JR-Strata-Vulkan";
-    app.engineVersion = VK_MAKE_VERSION(0, 0, 1);
+    app.engineVersion = VK_MAKE_VERSION(0, 6, 0);
     app.apiVersion = VK_API_VERSION_1_3;
 
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -157,11 +157,15 @@ void Context::query_caps() {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
-    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+    VkPhysicalDevicePCIBusInfoPropertiesEXT pci{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+    VkPhysicalDeviceShaderIntegerDotProductProperties intdot_props{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
 
     props2.pNext = &subgroup;
     void** tail = &subgroup.pNext;
+
     if (caps_.ext_subgroup_size_control) {
         *tail = &subgroup_ctl_props;
         tail = &subgroup_ctl_props.pNext;
@@ -174,7 +178,11 @@ void Context::query_caps() {
         *tail = &pci;
         tail = &pci.pNext;
     }
-    *tail = nullptr;
+
+    // Core Vulkan 1.3 property structure. B60 exposes API >= 1.3.
+    *tail = &intdot_props;
+    intdot_props.pNext = nullptr;
+
     vkGetPhysicalDeviceProperties2(physical_device_, &props2);
 
     caps_.device_name = props2.properties.deviceName;
@@ -182,12 +190,14 @@ void Context::query_caps() {
     caps_.device_id = props2.properties.deviceID;
     caps_.api_version = props2.properties.apiVersion;
     caps_.subgroup_size = subgroup.subgroupSize;
+
     if (caps_.ext_subgroup_size_control) {
         caps_.min_subgroup_size = subgroup_ctl_props.minSubgroupSize;
         caps_.max_subgroup_size = subgroup_ctl_props.maxSubgroupSize;
     }
     if (caps_.ext_external_memory_host)
         caps_.min_imported_host_pointer_alignment = host_props.minImportedHostPointerAlignment;
+
     if (caps_.ext_pci_bus_info) {
         caps_.has_pci_bus_info = true;
         caps_.pci_domain = pci.pciDomain;
@@ -196,12 +206,18 @@ void Context::query_caps() {
         caps_.pci_function = pci.pciFunction;
     }
 
-    VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_ctl{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+    caps_.intdot_4x8_packed_signed_accelerated =
+        intdot_props.integerDotProduct4x8BitPackedSignedAccelerated == VK_TRUE;
+    caps_.intdot_4x8_packed_mixed_accelerated =
+        intdot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated == VK_TRUE;
+
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+
     f2.pNext = &f12;
-    f12.pNext = caps_.ext_subgroup_size_control ? &subgroup_ctl : nullptr;
+    f12.pNext = &f13;
+    f13.pNext = nullptr;
     vkGetPhysicalDeviceFeatures2(physical_device_, &f2);
 
     caps_.shader_int64 = f2.features.shaderInt64 == VK_TRUE;
@@ -209,10 +225,10 @@ void Context::query_caps() {
     caps_.timeline_semaphore = f12.timelineSemaphore == VK_TRUE;
     caps_.shader_float16 = f12.shaderFloat16 == VK_TRUE;
     caps_.shader_int8 = f12.shaderInt8 == VK_TRUE;
-    if (caps_.ext_subgroup_size_control) {
-        caps_.subgroup_size_control = subgroup_ctl.subgroupSizeControl == VK_TRUE;
-        caps_.compute_full_subgroups = subgroup_ctl.computeFullSubgroups == VK_TRUE;
-    }
+
+    caps_.subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
+    caps_.compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
+    caps_.shader_integer_dot_product = f13.shaderIntegerDotProduct == VK_TRUE;
 }
 
 void Context::create_device() {
@@ -234,17 +250,15 @@ void Context::create_device() {
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
 
-    VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_ctl{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
-    if (caps_.ext_subgroup_size_control) {
-        subgroup_ctl.subgroupSizeControl = caps_.subgroup_size_control ? VK_TRUE : VK_FALSE;
-        subgroup_ctl.computeFullSubgroups = caps_.compute_full_subgroups ? VK_TRUE : VK_FALSE;
-    }
+    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    f13.subgroupSizeControl = caps_.subgroup_size_control ? VK_TRUE : VK_FALSE;
+    f13.computeFullSubgroups = caps_.compute_full_subgroups ? VK_TRUE : VK_FALSE;
+    f13.shaderIntegerDotProduct = caps_.shader_integer_dot_product ? VK_TRUE : VK_FALSE;
 
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE;
     f12.timelineSemaphore = VK_TRUE;
-    f12.pNext = caps_.ext_subgroup_size_control ? &subgroup_ctl : nullptr;
+    f12.pNext = &f13;
 
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f12;
@@ -258,7 +272,8 @@ void Context::create_device() {
     if (!queue_) throw std::runtime_error("vkGetDeviceQueue returned null");
 }
 
-uint32_t Context::find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags required,
+uint32_t Context::find_memory_type(uint32_t type_bits,
+                                   VkMemoryPropertyFlags required,
                                    VkMemoryPropertyFlags preferred) const {
     VkPhysicalDeviceMemoryProperties mp{};
     vkGetPhysicalDeviceMemoryProperties(physical_device_, &mp);

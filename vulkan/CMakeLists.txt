@@ -45,6 +45,18 @@ jr_compile_shader(jr_vk_q8_quant_shader q8_1_quant.comp)
 jr_compile_shader(jr_vk_swiglu_q8_shader swiglu_q8_1.comp)
 jr_compile_shader(jr_vk_q8_gemv_shader fused_q8_expert_gemv.comp)
 jr_compile_shader(jr_vk_weighted_accum_shader weighted_accum.comp)
+jr_compile_shader(jr_vk_v5_grouped_gemv_shader v5_grouped_q8_gemv.comp)
+jr_compile_shader(jr_vk_v6_hwdot_shader v6_grouped_q8_gemv_hwdot.comp)
+jr_compile_shader(jr_vk_v7_quadrow_shader v7_grouped_q8_gemv_quadrow.comp)
+jr_compile_shader(jr_vk_v8_t16_shader v8_t16_q8_gemv.comp)
+jr_compile_shader(jr_vk_v8_t17_shader v8_t17_q8_gemv.comp)
+jr_compile_shader(jr_vk_v8_t18_shader v8_t18_q8_gemv.comp)
+jr_compile_shader(jr_vk_v8_t20_shader v8_t20_q8_gemv.comp)
+jr_compile_shader(jr_vk_v8_t21_shader v8_t21_q8_gemv.comp)
+jr_compile_shader(jr_vk_v8_t22_shader v8_t22_q8_gemv.comp)
+jr_compile_shader(jr_vk_v8_t42_shader v8_t42_q8_gemv.comp)
+jr_compile_shader(jr_vk_v5_grouped_swiglu_shader v5_grouped_swiglu_q8.comp)
+jr_compile_shader(jr_vk_v5_combine_shader v5_route_combine.comp)
 
 add_library(jr_vk_runtime STATIC
     src/vk_context.cpp
@@ -164,3 +176,135 @@ target_compile_definitions(jr-vk-routed-expert PRIVATE
     JR_VK_WEIGHTED_ACCUM_SHADER="${jr_vk_weighted_accum_shader_SPV}"
 )
 target_compile_options(jr-vk-routed-expert PRIVATE -Wall -Wextra -Wpedantic)
+
+
+# V5: production-shaped routed engine.
+#
+# One persistent command buffer executes the entire top-k group:
+#   x -> q8_1
+#   grouped gate+up (all selected experts in one dispatch)
+#   grouped SwiGLU -> q8_1
+#   grouped down (all selected experts in one dispatch)
+#   route-weighted combine
+#
+# Selected expert blobs are packed once into two route arenas:
+#   tier 0 = imported system RAM
+#   tier 1 = device-local VRAM
+# and addressed by a compact expert metadata table.
+add_executable(jr-vk-routed-engine-v5
+    src/routed_engine_v5.cpp
+)
+add_dependencies(jr-vk-routed-engine-v5
+    jr_vk_q8_quant_shader
+    jr_vk_v5_grouped_gemv_shader
+    jr_vk_v5_grouped_swiglu_shader
+    jr_vk_v5_combine_shader
+)
+target_link_libraries(jr-vk-routed-engine-v5 PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-routed-engine-v5 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-routed-engine-v5 PRIVATE
+    JR_VK_Q8_QUANT_SHADER="${jr_vk_q8_quant_shader_SPV}"
+    JR_VK_V5_GROUPED_GEMV_SHADER="${jr_vk_v5_grouped_gemv_shader_SPV}"
+    JR_VK_V5_GROUPED_SWIGLU_SHADER="${jr_vk_v5_grouped_swiglu_shader_SPV}"
+    JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
+)
+target_compile_options(jr-vk-routed-engine-v5 PRIVATE -Wall -Wextra -Wpedantic)
+
+
+# V6: hardware packed integer-dot specialization.
+#
+# Same persistent/grouped engine as V5, but the hot quantized dot path can use
+# GL_EXT_integer_dot_product -> OpSDotKHR when the selected Vulkan device
+# advertises shaderIntegerDotProduct. Auto mode requires the driver to also
+# report integerDotProduct4x8BitPackedSignedAccelerated.
+add_executable(jr-vk-routed-engine-v6
+    src/routed_engine_v6.cpp
+)
+add_dependencies(jr-vk-routed-engine-v6
+    jr_vk_q8_quant_shader
+    jr_vk_v5_grouped_gemv_shader
+    jr_vk_v6_hwdot_shader
+    jr_vk_v5_grouped_swiglu_shader
+    jr_vk_v5_combine_shader
+)
+target_link_libraries(jr-vk-routed-engine-v6 PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-routed-engine-v6 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-routed-engine-v6 PRIVATE
+    JR_VK_Q8_QUANT_SHADER="${jr_vk_q8_quant_shader_SPV}"
+    JR_VK_V5_SOFT_GEMV_SHADER="${jr_vk_v5_grouped_gemv_shader_SPV}"
+    JR_VK_V6_HWDOT_SHADER="${jr_vk_v6_hwdot_shader_SPV}"
+    JR_VK_V5_GROUPED_SWIGLU_SHADER="${jr_vk_v5_grouped_swiglu_shader_SPV}"
+    JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
+)
+target_compile_options(jr-vk-routed-engine-v6 PRIVATE -Wall -Wextra -Wpedantic)
+
+
+# V7: B60/Xe2 production specialization.
+#
+# Four output rows share one 32-lane workgroup; each row is computed by 8 lanes.
+# This increases per-lane work, reuses quant block scale/metadata, cuts row
+# workgroup count by 4x, and retains accelerated packed signed 4x8 OpSDot.
+add_executable(jr-vk-routed-engine-v7
+    src/routed_engine_v7.cpp
+)
+add_dependencies(jr-vk-routed-engine-v7
+    jr_vk_q8_quant_shader
+    jr_vk_v7_quadrow_shader
+    jr_vk_v5_grouped_swiglu_shader
+    jr_vk_v5_combine_shader
+)
+target_link_libraries(jr-vk-routed-engine-v7 PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-routed-engine-v7 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-routed-engine-v7 PRIVATE
+    JR_VK_Q8_QUANT_SHADER="${jr_vk_q8_quant_shader_SPV}"
+    JR_VK_V7_QUADROW_SHADER="${jr_vk_v7_quadrow_shader_SPV}"
+    JR_VK_V5_GROUPED_SWIGLU_SHADER="${jr_vk_v5_grouped_swiglu_shader_SPV}"
+    JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
+)
+target_compile_options(jr-vk-routed-engine-v7 PRIVATE -Wall -Wextra -Wpedantic)
+
+
+# V8: format-specialized Xe2 expert kernels.
+#
+# All selected experts in a production layer share one gate/up quant format and
+# one down quant format. V7 still carried all seven decoders in a single shader.
+# V8 compiles one shader per real production quant type and picks the two
+# required pipelines once per route bundle.
+add_executable(jr-vk-routed-engine-v8
+    src/routed_engine_v8.cpp
+)
+add_dependencies(jr-vk-routed-engine-v8
+    jr_vk_q8_quant_shader
+    jr_vk_v8_t16_shader
+    jr_vk_v8_t17_shader
+    jr_vk_v8_t18_shader
+    jr_vk_v8_t20_shader
+    jr_vk_v8_t21_shader
+    jr_vk_v8_t22_shader
+    jr_vk_v8_t42_shader
+    jr_vk_v5_grouped_swiglu_shader
+    jr_vk_v5_combine_shader
+)
+target_link_libraries(jr-vk-routed-engine-v8 PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-routed-engine-v8 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-routed-engine-v8 PRIVATE
+    JR_VK_Q8_QUANT_SHADER="${jr_vk_q8_quant_shader_SPV}"
+    JR_VK_V8_T16_SHADER="${jr_vk_v8_t16_shader_SPV}"
+    JR_VK_V8_T17_SHADER="${jr_vk_v8_t17_shader_SPV}"
+    JR_VK_V8_T18_SHADER="${jr_vk_v8_t18_shader_SPV}"
+    JR_VK_V8_T20_SHADER="${jr_vk_v8_t20_shader_SPV}"
+    JR_VK_V8_T21_SHADER="${jr_vk_v8_t21_shader_SPV}"
+    JR_VK_V8_T22_SHADER="${jr_vk_v8_t22_shader_SPV}"
+    JR_VK_V8_T42_SHADER="${jr_vk_v8_t42_shader_SPV}"
+    JR_VK_V5_GROUPED_SWIGLU_SHADER="${jr_vk_v5_grouped_swiglu_shader_SPV}"
+    JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
+)
+target_compile_options(jr-vk-routed-engine-v8 PRIVATE -Wall -Wextra -Wpedantic)

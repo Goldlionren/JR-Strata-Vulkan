@@ -1,0 +1,438 @@
+#version 460
+#extension GL_EXT_integer_dot_product : require
+#define JR_TYPE 21
+
+// JR-Strata-Vulkan V8 format-specialized type 21 Xe2 routed GEMV.
+//
+// Performance shape:
+//   - one subgroup/workgroup = 32 lanes
+//   - split into four independent 8-lane row groups
+//   - one workgroup computes FOUR output rows
+//   - each 8-lane group reuses block scale/metadata while iterating sub-blocks
+//   - packed signed 4x8 hardware dot via OpSDot
+//
+// This mirrors the useful production observation from the SYCL backend:
+// 8 expert lanes give each lane enough work on the 2560-wide expert rows.
+//
+// gl_WorkGroupID.x = group of 4 output rows
+// gl_WorkGroupID.y = route rank
+//
+// role = 0:
+//   total rows = 2*n_ff (gate then up)
+// role = 1:
+//   total rows = n_embd (down)
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer RamWeights {
+    uint ram_words[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer VramWeights {
+    uint vram_words[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer Q8Input {
+    uint q8[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer Output {
+    float y[];
+};
+layout(set = 0, binding = 4, std430) readonly buffer ExpertMeta {
+    uint meta[];
+};
+
+layout(set = 0, binding = 5, std430) readonly buffer IQ2XXSGrid {
+    uvec2 iq2xxs_grid[];
+};
+layout(set = 0, binding = 6, std430) readonly buffer IQ2XSGrid {
+    uvec2 iq2xs_grid[];
+};
+layout(set = 0, binding = 7, std430) readonly buffer IQ2SGrid {
+    uvec2 iq2s_grid[];
+};
+layout(set = 0, binding = 8, std430) readonly buffer IQ3XXSGrid {
+    uint iq3xxs_grid[];
+};
+layout(set = 0, binding = 9, std430) readonly buffer IQ3SGrid {
+    uint iq3s_grid[];
+};
+layout(set = 0, binding = 10, std430) readonly buffer KSigns {
+    uint ksigns[];
+};
+layout(set = 0, binding = 11, std430) readonly buffer IQ4Values {
+    int iq4_values[];
+};
+
+layout(push_constant) uniform Push {
+    uint k;
+    uint n_embd;
+    uint n_ff;
+    uint role;
+} pc;
+
+shared float reduce_buf[32];
+
+uint m(uint rank, uint field) {
+    return meta[rank * 8u + field];
+}
+
+uint tier_word(uint tier, uint word_index) {
+    return tier == 0u ? ram_words[word_index] : vram_words[word_index];
+}
+
+uint load_u8(uint tier, uint off) {
+    uint w = tier_word(tier, off >> 2u);
+    return (w >> ((off & 3u) * 8u)) & 0xffu;
+}
+
+// Explicit unaligned word fetch.
+// Compared with four load_u8() calls this guarantees at most two uint loads.
+uint load_u32_fast(uint tier, uint off) {
+    uint wi = off >> 2u;
+    uint sh = (off & 3u) * 8u;
+    uint lo = tier_word(tier, wi);
+    if (sh == 0u) return lo;
+    uint hi = tier_word(tier, wi + 1u);
+    return (lo >> sh) | (hi << (32u - sh));
+}
+
+uint load_u16_fast(uint tier, uint off) {
+    return load_u32_fast(tier, off) & 0xffffu;
+}
+
+float load_f16(uint tier, uint off) {
+    return unpackHalf2x16(load_u16_fast(tier, off)).x;
+}
+
+uint byte32(uint v, uint j) {
+    return (v >> (8u * j)) & 0xffu;
+}
+
+uint pack_s8_4(int a, int b, int c, int d) {
+    return (uint(a) & 0xffu) |
+           ((uint(b) & 0xffu) << 8u) |
+           ((uint(c) & 0xffu) << 16u) |
+           ((uint(d) & 0xffu) << 24u);
+}
+
+int dp4a_hw(uint a, uint b) {
+    return dotPacked4x8EXT(int(a), int(b));
+}
+
+uint q8_block_base(uint q8_base_words, uint value_index) {
+    return q8_base_words + (value_index >> 5u) * 9u;
+}
+
+float q8_scale(uint q8_base_words, uint value_index) {
+    return unpackHalf2x16(q8[q8_block_base(q8_base_words, value_index)]).x;
+}
+
+uint q8_word4(uint q8_base_words, uint value_index) {
+    uint block_base = q8_block_base(q8_base_words, value_index);
+    uint lane4 = value_index & 31u;
+    return q8[block_base + 1u + (lane4 >> 2u)];
+}
+
+uint signed_grid4(uint raw, uint sign_bits, uint sign_shift) {
+    int a = int(byte32(raw, 0u));
+    int b = int(byte32(raw, 1u));
+    int c = int(byte32(raw, 2u));
+    int d = int(byte32(raw, 3u));
+    if ((sign_bits & (1u << (sign_shift + 0u))) != 0u) a = -a;
+    if ((sign_bits & (1u << (sign_shift + 1u))) != 0u) b = -b;
+    if ((sign_bits & (1u << (sign_shift + 2u))) != 0u) c = -c;
+    if ((sign_bits & (1u << (sign_shift + 3u))) != 0u) d = -d;
+    return pack_s8_4(a, b, c, d);
+}
+
+int dot8_grid(uvec2 g, uint signs, uint q8_base_words, uint value_index) {
+    uint w0 = signed_grid4(g.x, signs, 0u);
+    uint w1 = signed_grid4(g.y, signs, 4u);
+    return dp4a_hw(w0, q8_word4(q8_base_words, value_index)) +
+           dp4a_hw(w1, q8_word4(q8_base_words, value_index + 4u));
+}
+
+int dot8_iq3(uint g0, uint g1, uint signs,
+             uint q8_base_words, uint value_index) {
+    uint w0 = signed_grid4(g0, signs, 0u);
+    uint w1 = signed_grid4(g1, signs, 4u);
+    return dp4a_hw(w0, q8_word4(q8_base_words, value_index)) +
+           dp4a_hw(w1, q8_word4(q8_base_words, value_index + 4u));
+}
+
+uint iq4_word_raw(uint raw, bool high) {
+    int a = iq4_values[high ? (byte32(raw, 0u) >> 4u) : (byte32(raw, 0u) & 0xfu)];
+    int b = iq4_values[high ? (byte32(raw, 1u) >> 4u) : (byte32(raw, 1u) & 0xfu)];
+    int c = iq4_values[high ? (byte32(raw, 2u) >> 4u) : (byte32(raw, 2u) & 0xfu)];
+    int d = iq4_values[high ? (byte32(raw, 3u) >> 4u) : (byte32(raw, 3u) & 0xfu)];
+    return pack_s8_4(a, b, c, d);
+}
+
+uint q2_codes4(uint packed) {
+    int a = int((packed >> 0u) & 3u) - 1;
+    int b = int((packed >> 2u) & 3u) - 1;
+    int c = int((packed >> 4u) & 3u) - 1;
+    int d = int((packed >> 6u) & 3u) - 1;
+    return pack_s8_4(a, b, c, d);
+}
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint row_lane = lane >> 3u;  // 0..3
+    const uint sub = lane & 7u;        // 0..7
+    const uint rank = gl_WorkGroupID.y;
+    const uint row_global = gl_WorkGroupID.x * 4u + row_lane;
+
+    const uint total_rows = pc.role == 0u ? 2u * pc.n_ff : pc.n_embd;
+    const bool row_valid = rank < pc.k && row_global < total_rows;
+
+    uint tier = 0u;
+    uint base = 0u;
+    uint row_bytes = 0u;
+    uint cols = 0u;
+    uint row = 0u;
+    uint q8_base_words = 0u;
+    uint out_index = 0u;
+    float acc = 0.0;
+
+    if (row_valid) {
+        tier = m(rank, 0u);
+
+        if (pc.role == 0u) {
+            const bool is_up = row_global >= pc.n_ff;
+            row = is_up ? row_global - pc.n_ff : row_global;
+            base = is_up ? m(rank, 4u) : m(rank, 3u);
+            row_bytes = m(rank, 6u);
+            cols = pc.n_embd;
+            q8_base_words = 0u;
+            out_index = rank * (2u * pc.n_ff) + row_global;
+        } else {
+            row = row_global;
+            base = m(rank, 5u);
+            row_bytes = m(rank, 7u);
+            cols = pc.n_ff;
+            q8_base_words = rank * (pc.n_ff / 32u) * 9u;
+            out_index = rank * pc.n_embd + row;
+        }
+
+        const uint row0 = base + row * row_bytes;
+
+#if JR_TYPE == 16
+        { // IQ2_XXS
+            const uint nb = cols / 256u;
+            const uint ib = sub;
+            for (uint b = 0u; b < nb; ++b) {
+                const uint sb = row0 + b * 66u;
+                const float d0 = load_f16(tier, sb);
+                const uint qbase = sb + 2u + 8u * ib;
+                const uint aux32 = load_u32_fast(tier, qbase + 4u);
+                const float dw = d0 * (0.5 + float(aux32 >> 28u)) * 0.25;
+                for (uint il = 0u; il < 4u; ++il) {
+                    const uint gi = load_u8(tier, qbase + il);
+                    const uint signs = ksigns[(aux32 >> (7u * il)) & 127u] & 0xffu;
+                    const uint vi = b * 256u + 32u * ib + 8u * il;
+                    const int sumi = dot8_grid(
+                        iq2xxs_grid[gi], signs, q8_base_words, vi);
+                    acc += (dw * q8_scale(q8_base_words, vi)) * float(sumi);
+                }
+            }
+        }
+#elif JR_TYPE == 17
+        { // IQ2_XS
+            const uint nb = cols / 256u;
+            const uint ib = sub;
+            for (uint b = 0u; b < nb; ++b) {
+                const uint sb = row0 + b * 74u;
+                const float d0 = load_f16(tier, sb);
+                const uint qs = sb + 2u;
+                const uint scales = qs + 64u;
+                const uint sc = load_u8(tier, scales + ib);
+                for (uint il = 0u; il < 4u; ++il) {
+                    const uint q = load_u16_fast(
+                        tier, qs + 2u * (4u * ib + il));
+                    const uint nib = (sc >> (4u * (il >> 1u))) & 0xfu;
+                    const float dw = d0 * (0.5 + float(nib)) * 0.25;
+                    const uint signs = ksigns[q >> 9u] & 0xffu;
+                    const uint vi = b * 256u + 32u * ib + 8u * il;
+                    const int sumi = dot8_grid(
+                        iq2xs_grid[q & 511u], signs, q8_base_words, vi);
+                    acc += (dw * q8_scale(q8_base_words, vi)) * float(sumi);
+                }
+            }
+        }
+#elif JR_TYPE == 22
+        { // IQ2_S
+            const uint nb = cols / 256u;
+            const uint ib = sub;
+            for (uint b = 0u; b < nb; ++b) {
+                const uint sb = row0 + b * 82u;
+                const float d0 = load_f16(tier, sb);
+                const uint qs = sb + 2u;
+                const uint qh = qs + 64u;
+                const uint scales = qh + 8u;
+                const uint hi = load_u8(tier, qh + ib);
+                const uint sc = load_u8(tier, scales + ib);
+                for (uint il = 0u; il < 4u; ++il) {
+                    const uint qi = load_u8(tier, qs + 4u * ib + il);
+                    const uint gi = qi | ((hi << (8u - 2u * il)) & 0x300u);
+                    const uint nib = (sc >> (4u * (il >> 1u))) & 0xfu;
+                    const float dw = d0 * (0.5 + float(nib)) * 0.25;
+                    const uint signs = load_u8(
+                        tier, qs + 32u + 4u * ib + il);
+                    const uint vi = b * 256u + 32u * ib + 8u * il;
+                    const int sumi = dot8_grid(
+                        iq2s_grid[gi], signs, q8_base_words, vi);
+                    acc += (dw * q8_scale(q8_base_words, vi)) * float(sumi);
+                }
+            }
+        }
+#elif JR_TYPE == 18
+        { // IQ3_XXS
+            const uint nb = cols / 256u;
+            const uint ib = sub;
+            for (uint b = 0u; b < nb; ++b) {
+                const uint sb = row0 + b * 98u;
+                const float d0 = load_f16(tier, sb);
+                const uint qs = sb + 2u;
+                const uint q3 = qs + 8u * ib;
+                const uint aux32 = load_u32_fast(tier, qs + 64u + 4u * ib);
+                const float dw = d0 * (0.5 + float(aux32 >> 28u)) * 0.5;
+                for (uint il = 0u; il < 4u; ++il) {
+                    const uint qpair = load_u16_fast(
+                        tier, q3 + 2u * il);
+                    const uint q0 = qpair & 0xffu;
+                    const uint q1 = qpair >> 8u;
+                    const uint signs = ksigns[(aux32 >> (7u * il)) & 127u] & 0xffu;
+                    const uint vi = b * 256u + 32u * ib + 8u * il;
+                    const int sumi = dot8_iq3(
+                        iq3xxs_grid[q0], iq3xxs_grid[q1],
+                        signs, q8_base_words, vi);
+                    acc += (dw * q8_scale(q8_base_words, vi)) * float(sumi);
+                }
+            }
+        }
+#elif JR_TYPE == 21
+        { // IQ3_S
+            const uint nb = cols / 256u;
+            const uint ib = sub;
+            for (uint b = 0u; b < nb; ++b) {
+                const uint sb = row0 + b * 110u;
+                const float d0 = load_f16(tier, sb);
+                const uint qs = sb + 2u;
+                const uint qh = qs + 64u;
+                const uint signs_base = qh + 8u;
+                const uint scales = signs_base + 32u;
+                const uint qbase = qs + 8u * ib;
+                const uint hi = load_u8(tier, qh + ib);
+                const uint sc = load_u8(tier, scales + (ib >> 1u));
+                const uint nib = (sc >> (4u * (ib & 1u))) & 0xfu;
+                const float dw = d0 * float(1u + 2u * nib);
+                for (uint il = 0u; il < 4u; ++il) {
+                    const uint qpair = load_u16_fast(
+                        tier, qbase + 2u * il);
+                    const uint q0 = qpair & 0xffu;
+                    const uint q1 = qpair >> 8u;
+                    const uint idx0 = q0 | ((hi << (8u - 2u * il)) & 0x100u);
+                    const uint idx1 = q1 | ((hi << (7u - 2u * il)) & 0x100u);
+                    const uint signs = load_u8(
+                        tier, signs_base + 4u * ib + il);
+                    const uint vi = b * 256u + 32u * ib + 8u * il;
+                    const int sumi = dot8_iq3(
+                        iq3s_grid[idx0], iq3s_grid[idx1],
+                        signs, q8_base_words, vi);
+                    acc += (dw * q8_scale(q8_base_words, vi)) * float(sumi);
+                }
+            }
+        }
+#elif JR_TYPE == 20
+        { // IQ4_NL
+            const uint nblocks = cols / 32u;
+            const uint chunks = (nblocks + 7u) / 8u;
+            for (uint c = 0u; c < chunks; ++c) {
+                const uint bi = c * 8u + sub;
+                if (bi < nblocks) {
+                    const uint wb = row0 + bi * 18u;
+                    const float dw = load_f16(tier, wb);
+                    const uint qs = wb + 2u;
+
+                    // Fetch all 16 packed-nibble bytes once for this block.
+                    const uint r0 = load_u32_fast(tier, qs + 0u);
+                    const uint r1 = load_u32_fast(tier, qs + 4u);
+                    const uint r2 = load_u32_fast(tier, qs + 8u);
+                    const uint r3 = load_u32_fast(tier, qs + 12u);
+
+                    for (uint il = 0u; il < 4u; ++il) {
+                        const bool high = il >= 2u;
+                        const bool upper8 = (il & 1u) != 0u;
+                        const uint a = upper8 ? r2 : r0;
+                        const uint b4 = upper8 ? r3 : r1;
+                        const uint vi = bi * 32u + il * 8u;
+                        const int sumi =
+                            dp4a_hw(iq4_word_raw(a, high),
+                                    q8_word4(q8_base_words, vi)) +
+                            dp4a_hw(iq4_word_raw(b4, high),
+                                    q8_word4(q8_base_words, vi + 4u));
+                        acc += (dw * q8_scale(q8_base_words, vi)) * float(sumi);
+                    }
+                }
+            }
+        }
+#elif JR_TYPE == 42
+        { // Q2_0
+            const uint nblocks = cols / 64u;
+            const uint chunks = (nblocks + 7u) / 8u;
+            for (uint c = 0u; c < chunks; ++c) {
+                const uint bi = c * 8u + sub;
+                if (bi < nblocks) {
+                    const uint wb = row0 + bi * 18u;
+                    const float dw = load_f16(tier, wb);
+                    const uint qs = wb + 2u;
+
+                    // 64 x 2-bit values = 16 bytes. Read once, then reuse for
+                    // all eight q8_1 8-value parts of this block.
+                    const uint r0 = load_u32_fast(tier, qs + 0u);
+                    const uint r1 = load_u32_fast(tier, qs + 4u);
+                    const uint r2 = load_u32_fast(tier, qs + 8u);
+                    const uint r3 = load_u32_fast(tier, qs + 12u);
+
+                    for (uint part = 0u; part < 8u; ++part) {
+                        const uint word_sel = part >> 1u;
+                        const uint raw =
+                            word_sel == 0u ? r0 :
+                            word_sel == 1u ? r1 :
+                            word_sel == 2u ? r2 : r3;
+                        const uint pair16 = (raw >> ((part & 1u) * 16u)) & 0xffffu;
+                        const uint w0 = q2_codes4(pair16 & 0xffu);
+                        const uint w1 = q2_codes4(pair16 >> 8u);
+                        const uint vi = bi * 64u + part * 8u;
+                        const int sumi =
+                            dp4a_hw(w0, q8_word4(q8_base_words, vi)) +
+                            dp4a_hw(w1, q8_word4(q8_base_words, vi + 4u));
+                        acc += (dw * q8_scale(q8_base_words, vi)) * float(sumi);
+                    }
+                }
+            }
+        }
+#else
+#error Unsupported JR_TYPE
+#endif
+
+    }
+
+    // Four independent 8-lane reductions. Compared with V6:
+    //   - 3 reduction barriers instead of 5
+    //   - 4 output rows per workgroup
+    reduce_buf[lane] = acc;
+    barrier();
+
+    const uint group_base = row_lane * 8u;
+    for (uint s = 4u; s > 0u; s >>= 1u) {
+        if (sub < s) {
+            reduce_buf[group_base + sub] +=
+                reduce_buf[group_base + sub + s];
+        }
+        barrier();
+    }
+
+    if (row_valid && sub == 0u)
+        y[out_index] = reduce_buf[group_base];
+}
