@@ -1,0 +1,262 @@
+#version 460
+
+// V3 fused expert GEMV.
+//
+// Quantized weights remain in their production representation and may live in
+// imported system RAM. Each 32-lane workgroup computes one output row directly
+// from quantized bytes and an F32 activation vector.
+//
+// This intentionally removes V2's:
+//     quantized weights -> full F32 matrix -> GEMV
+//
+// Supported production formats:
+//  16 IQ2_XXS
+//  17 IQ2_XS
+//  18 IQ3_XXS
+//  20 IQ4_NL
+//  21 IQ3_S
+//  22 IQ2_S
+//  42 Q2_0
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QuantWords {
+    uint qwords[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer InputVector {
+    float x[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer OutputVector {
+    float y[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer IQ2XXSGrid {
+    uvec2 iq2xxs_grid[];
+};
+layout(set = 0, binding = 4, std430) readonly buffer IQ2XSGrid {
+    uvec2 iq2xs_grid[];
+};
+layout(set = 0, binding = 5, std430) readonly buffer IQ2SGrid {
+    uvec2 iq2s_grid[];
+};
+layout(set = 0, binding = 6, std430) readonly buffer IQ3XXSGrid {
+    uint iq3xxs_grid[];
+};
+layout(set = 0, binding = 7, std430) readonly buffer IQ3SGrid {
+    uint iq3s_grid[];
+};
+layout(set = 0, binding = 8, std430) readonly buffer KSigns {
+    uint ksigns[];
+};
+layout(set = 0, binding = 9, std430) readonly buffer IQ4Values {
+    int iq4_values[];
+};
+
+layout(push_constant) uniform Push {
+    uint type_id;
+    uint rows;
+    uint cols;
+    uint row_bytes;
+} pc;
+
+shared float reduce_buf[32];
+
+uint load_u8(uint off) {
+    uint w = qwords[off >> 2u];
+    return (w >> ((off & 3u) * 8u)) & 0xffu;
+}
+
+uint load_u16(uint off) {
+    return load_u8(off) | (load_u8(off + 1u) << 8u);
+}
+
+uint load_u32(uint off) {
+    return load_u8(off) |
+           (load_u8(off + 1u) << 8u) |
+           (load_u8(off + 2u) << 16u) |
+           (load_u8(off + 3u) << 24u);
+}
+
+float load_f16(uint off) {
+    return unpackHalf2x16(load_u16(off)).x;
+}
+
+uint byte32(uint v, uint j) {
+    return (v >> (8u * j)) & 0xffu;
+}
+
+uint byte64(uvec2 v, uint j) {
+    return j < 4u ? byte32(v.x, j) : byte32(v.y, j - 4u);
+}
+
+float signed_grid8_dot(uvec2 g, uint signs, uint xbase) {
+    float s = 0.0;
+    for (uint j = 0u; j < 8u; ++j) {
+        float w = float(byte64(g, j));
+        if ((signs & (1u << j)) != 0u) w = -w;
+        s += w * x[xbase + j];
+    }
+    return s;
+}
+
+float iq3_pair_dot(uint g0, uint g1, uint signs, float d, uint xbase) {
+    float s = 0.0;
+    for (uint j = 0u; j < 4u; ++j) {
+        float w0 = d * float(byte32(g0, j));
+        float w1 = d * float(byte32(g1, j));
+        if ((signs & (1u << j)) != 0u) w0 = -w0;
+        if ((signs & (1u << (j + 4u))) != 0u) w1 = -w1;
+        s += w0 * x[xbase + j];
+        s += w1 * x[xbase + j + 4u];
+    }
+    return s;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    uint il = lane >> 3u;
+    uint ib = lane & 7u;
+    uint row0 = row * pc.row_bytes;
+
+    float acc = 0.0;
+
+    if (pc.type_id == 16u) { // IQ2_XXS
+        uint nb = pc.cols / 256u;
+        for (uint b = 0u; b < nb; ++b) {
+            uint base = row0 + b * 66u;
+            float d0 = load_f16(base);
+            uint qbase = base + 2u + 8u * ib;
+
+            uint aux32 = load_u32(qbase + 4u);
+            uint grid_idx = load_u8(qbase + il);
+            float d = d0 * (0.5 + float(aux32 >> 28u)) * 0.25;
+            uint signs = ksigns[(aux32 >> (7u * il)) & 127u] & 0xffu;
+            uint xb = b * 256u + 32u * ib + 8u * il;
+            acc += d * signed_grid8_dot(iq2xxs_grid[grid_idx], signs, xb);
+        }
+    } else if (pc.type_id == 17u) { // IQ2_XS
+        uint nb = pc.cols / 256u;
+        for (uint b = 0u; b < nb; ++b) {
+            uint base = row0 + b * 74u;
+            float d0 = load_f16(base);
+            uint qs = base + 2u;
+            uint scales = qs + 64u;
+
+            uint q = load_u16(qs + 2u * (4u * ib + il));
+            uint sc = load_u8(scales + ib);
+            uint nib = (sc >> (4u * (il >> 1u))) & 0xfu;
+            float d = d0 * (0.5 + float(nib)) * 0.25;
+            uint signs = ksigns[q >> 9u] & 0xffu;
+            uint xb = b * 256u + 32u * ib + 8u * il;
+            acc += d * signed_grid8_dot(iq2xs_grid[q & 511u], signs, xb);
+        }
+    } else if (pc.type_id == 22u) { // IQ2_S
+        uint nb = pc.cols / 256u;
+        for (uint b = 0u; b < nb; ++b) {
+            uint base = row0 + b * 82u;
+            float d0 = load_f16(base);
+            uint qs = base + 2u;
+            uint qh = qs + 64u;
+            uint scales = qh + 8u;
+
+            uint qi = load_u8(qs + 4u * ib + il);
+            uint hi = load_u8(qh + ib);
+            uint grid_idx = qi | ((hi << (8u - 2u * il)) & 0x300u);
+            uint sc = load_u8(scales + ib);
+            uint nib = (sc >> (4u * (il >> 1u))) & 0xfu;
+            float d = d0 * (0.5 + float(nib)) * 0.25;
+            uint signs = load_u8(qs + 32u + 4u * ib + il);
+            uint xb = b * 256u + 32u * ib + 8u * il;
+            acc += d * signed_grid8_dot(iq2s_grid[grid_idx], signs, xb);
+        }
+    } else if (pc.type_id == 18u) { // IQ3_XXS
+        uint nb = pc.cols / 256u;
+        for (uint b = 0u; b < nb; ++b) {
+            uint base = row0 + b * 98u;
+            float d0 = load_f16(base);
+            uint qs = base + 2u;
+            uint q3 = qs + 8u * ib;
+            uint q0 = load_u8(q3 + 2u * il + 0u);
+            uint q1 = load_u8(q3 + 2u * il + 1u);
+            uint aux32 = load_u32(qs + 64u + 4u * ib);
+            float d = d0 * (0.5 + float(aux32 >> 28u)) * 0.5;
+            uint signs = ksigns[(aux32 >> (7u * il)) & 127u] & 0xffu;
+            uint xb = b * 256u + 32u * ib + 8u * il;
+            acc += iq3_pair_dot(iq3xxs_grid[q0], iq3xxs_grid[q1], signs, d, xb);
+        }
+    } else if (pc.type_id == 21u) { // IQ3_S
+        uint nb = pc.cols / 256u;
+        for (uint b = 0u; b < nb; ++b) {
+            uint base = row0 + b * 110u;
+            float d0 = load_f16(base);
+            uint qs = base + 2u;
+            uint qh = qs + 64u;
+            uint signs_base = qh + 8u;
+            uint scales = signs_base + 32u;
+
+            uint qbase = qs + 8u * ib;
+            uint hi = load_u8(qh + ib);
+            uint q0 = load_u8(qbase + 2u * il + 0u);
+            uint q1 = load_u8(qbase + 2u * il + 1u);
+            uint idx0 = q0 | ((hi << (8u - 2u * il)) & 0x100u);
+            uint idx1 = q1 | ((hi << (7u - 2u * il)) & 0x100u);
+            uint sc = load_u8(scales + (ib >> 1u));
+            uint nib = (sc >> (4u * (ib & 1u))) & 0xfu;
+            float d = d0 * float(1u + 2u * nib);
+            uint signs = load_u8(signs_base + 4u * ib + il);
+            uint xb = b * 256u + 32u * ib + 8u * il;
+            acc += iq3_pair_dot(iq3s_grid[idx0], iq3s_grid[idx1], signs, d, xb);
+        }
+    } else if (pc.type_id == 20u) { // IQ4_NL, 32 values/block
+        uint nblocks = pc.cols / 32u;
+        uint chunks = (nblocks + 7u) / 8u;
+        for (uint c = 0u; c < chunks; ++c) {
+            uint bi = c * 8u + ib;
+            if (bi < nblocks) {
+                uint base = row0 + bi * 18u;
+                float d = load_f16(base);
+                uint qs = base + 2u + 8u * (il & 1u);
+                bool high = il >= 2u;
+                uint xb = bi * 32u + il * 8u;
+                for (uint j = 0u; j < 8u; ++j) {
+                    uint q = load_u8(qs + j);
+                    uint idx = high ? (q >> 4u) : (q & 0xfu);
+                    acc += d * float(iq4_values[idx]) * x[xb + j];
+                }
+            }
+        }
+    } else if (pc.type_id == 42u) { // Q2_0, 64 values/block
+        uint nblocks = pc.cols / 64u;
+        uint b4 = lane >> 3u;
+        uint part = lane & 7u;
+        uint chunks = (nblocks + 3u) / 4u;
+        for (uint c = 0u; c < chunks; ++c) {
+            uint bi = c * 4u + b4;
+            if (bi < nblocks) {
+                uint base = row0 + bi * 18u;
+                float d = load_f16(base);
+                uint qs = base + 2u;
+                uint xb = bi * 64u + part * 8u;
+                for (uint j = 0u; j < 8u; ++j) {
+                    uint i = part * 8u + j;
+                    uint packed = load_u8(qs + (i >> 2u));
+                    uint code = (packed >> ((i & 3u) * 2u)) & 3u;
+                    acc += d * float(int(code) - 1) * x[xb + j];
+                }
+            }
+        }
+    }
+
+    reduce_buf[lane] = acc;
+    barrier();
+
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) reduce_buf[lane] += reduce_buf[lane + s];
+        barrier();
+    }
+
+    if (lane == 0u) y[row] = reduce_buf[0];
+}

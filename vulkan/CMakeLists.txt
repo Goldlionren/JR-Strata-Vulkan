@@ -40,6 +40,7 @@ jr_compile_shader(jr_vk_iq3xxs_shader iq3_xxs_dequant.comp)
 jr_compile_shader(jr_vk_expert_dequant_shader expert_dequant.comp)
 jr_compile_shader(jr_vk_expert_gemv_shader expert_gemv.comp)
 jr_compile_shader(jr_vk_expert_swiglu_shader expert_swiglu.comp)
+jr_compile_shader(jr_vk_fused_gemv_shader fused_expert_gemv.comp)
 
 add_library(jr_vk_runtime STATIC
     src/vk_context.cpp
@@ -112,3 +113,23 @@ target_compile_definitions(jr-vk-full-expert PRIVATE
     JR_VK_EXPERT_SWIGLU_SHADER="${jr_vk_expert_swiglu_shader_SPV}"
 )
 target_compile_options(jr-vk-full-expert PRIVATE -Wall -Wextra -Wpedantic)
+
+
+# V3: production-shaped expert path. Quantized weights are consumed directly
+# from imported host memory; no full F32 weight materialization.
+add_executable(jr-vk-fused-expert
+    src/fused_expert.cpp
+)
+add_dependencies(jr-vk-fused-expert
+    jr_vk_fused_gemv_shader
+    jr_vk_expert_swiglu_shader
+)
+target_link_libraries(jr-vk-fused-expert PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-fused-expert PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-fused-expert PRIVATE
+    JR_VK_FUSED_GEMV_SHADER="${jr_vk_fused_gemv_shader_SPV}"
+    JR_VK_EXPERT_SWIGLU_SHADER="${jr_vk_expert_swiglu_shader_SPV}"
+)
+target_compile_options(jr-vk-fused-expert PRIVATE -Wall -Wextra -Wpedantic)
