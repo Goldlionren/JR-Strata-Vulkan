@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
+
 project(jr_strata_vulkan_v0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -8,25 +9,60 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Vulkan REQUIRED)
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 
-set(SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/shaders/vector_add.comp")
-set(SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/shaders/vector_add.comp.spv")
+function(jr_compile_shader target_name shader_name)
+    set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader_name}")
+    set(out "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader_name}.spv")
 
-add_custom_command(
-    OUTPUT "${SHADER_OUT}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
-    COMMAND "${GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 "${SHADER_SRC}" -o "${SHADER_OUT}"
-    DEPENDS "${SHADER_SRC}"
-    COMMENT "Compiling vector_add.comp -> SPIR-V"
-    VERBATIM)
+    add_custom_command(
+        OUTPUT "${out}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+        COMMAND "${GLSLANG_VALIDATOR}"
+                -V
+                --target-env vulkan1.3
+                "${src}"
+                -o "${out}"
+        DEPENDS "${src}"
+        COMMENT "Compiling ${shader_name} -> SPIR-V"
+        VERBATIM
+    )
+    add_custom_target(${target_name} DEPENDS "${out}")
+    set(${target_name}_SPV "${out}" PARENT_SCOPE)
+endfunction()
 
-add_custom_target(jr_vk_shaders ALL DEPENDS "${SHADER_OUT}")
+jr_compile_shader(jr_vk_vector_shader vector_add.comp)
+jr_compile_shader(jr_vk_host_copy_shader host_copy.comp)
+
+add_library(jr_vk_runtime STATIC
+    src/vk_context.cpp
+)
+
+target_include_directories(jr_vk_runtime PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(jr_vk_runtime PUBLIC Vulkan::Vulkan)
+
+target_compile_options(jr_vk_runtime PRIVATE
+    -Wall -Wextra -Wpedantic
+)
 
 add_executable(jr-vk-v0
     src/main.cpp
-    src/vk_context.cpp)
-add_dependencies(jr-vk-v0 jr_vk_shaders)
+)
+add_dependencies(jr-vk-v0 jr_vk_vector_shader)
+target_link_libraries(jr-vk-v0 PRIVATE jr_vk_runtime)
+target_compile_definitions(jr-vk-v0 PRIVATE
+    JR_VK_VECTOR_SHADER="${jr_vk_vector_shader_SPV}"
+)
 
-target_include_directories(jr-vk-v0 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(jr-vk-v0 PRIVATE Vulkan::Vulkan)
-target_compile_definitions(jr-vk-v0 PRIVATE JR_VK_VECTOR_SHADER="${SHADER_OUT}")
-target_compile_options(jr-vk-v0 PRIVATE -Wall -Wextra -Wpedantic)
+add_executable(jr-vk-memprobe
+    src/memprobe.cpp
+)
+add_dependencies(jr-vk-memprobe jr_vk_host_copy_shader)
+target_link_libraries(jr-vk-memprobe PRIVATE jr_vk_runtime)
+target_compile_definitions(jr-vk-memprobe PRIVATE
+    JR_VK_HOST_COPY_SHADER="${jr_vk_host_copy_shader_SPV}"
+)
+target_compile_options(jr-vk-memprobe PRIVATE
+    -Wall -Wextra -Wpedantic
+)
