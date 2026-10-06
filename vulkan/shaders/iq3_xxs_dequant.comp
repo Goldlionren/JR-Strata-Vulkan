@@ -1,0 +1,117 @@
+#version 460
+
+// V1.0 correctness-first IQ3_XXS dequantizer.
+//
+// GGML block_iq3_xxs:
+//   fp16 d
+//   uint8 qs[96]
+// total 98 bytes for 256 output values.
+//
+// Exactly one 32-lane workgroup decodes one 256-value block.
+// This mirrors the proven Strata/SYCL mapping:
+//   il = lane / 8
+//   ib = lane % 8
+//   each lane writes 8 values.
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// Raw IQ3_XXS bytes packed into uint words.
+// Individual bytes are extracted explicitly because the 98-byte block stride
+// alternates between 0- and 2-byte alignment relative to uint32.
+layout(set = 0, binding = 0, std430) readonly buffer SrcWords {
+    uint src_words[];
+};
+
+// Official ggml iq3xxs_grid, one packed uint32 per entry.
+layout(set = 0, binding = 1, std430) readonly buffer GridTable {
+    uint grid_table[];
+};
+
+// Official ggml ksigns_iq2xs. One sign-mask byte stored in each uint.
+layout(set = 0, binding = 2, std430) readonly buffer SignTable {
+    uint sign_table[];
+};
+
+layout(set = 0, binding = 3, std430) writeonly buffer Output {
+    float out_values[];
+};
+
+layout(push_constant) uniform Push {
+    uint blocks;
+} pc;
+
+uint load_u8(uint byte_offset) {
+    uint w = src_words[byte_offset >> 2u];
+    uint sh = (byte_offset & 3u) * 8u;
+    return (w >> sh) & 0xffu;
+}
+
+uint load_u16(uint byte_offset) {
+    return load_u8(byte_offset) |
+           (load_u8(byte_offset + 1u) << 8u);
+}
+
+uint load_u32(uint byte_offset) {
+    return load_u8(byte_offset) |
+           (load_u8(byte_offset + 1u) << 8u) |
+           (load_u8(byte_offset + 2u) << 16u) |
+           (load_u8(byte_offset + 3u) << 24u);
+}
+
+uint grid_byte(uint packed, uint j) {
+    return (packed >> (8u * j)) & 0xffu;
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    uint lane  = gl_LocalInvocationID.x;
+
+    if (block >= pc.blocks) {
+        return;
+    }
+
+    const uint block_bytes = 98u;
+    uint base = block * block_bytes;
+
+    // fp16 d is the first two bytes. unpackHalf2x16 decodes the low half.
+    uint d_bits = load_u16(base);
+    float d0 = unpackHalf2x16(d_bits).x;
+
+    uint qs_base = base + 2u;
+
+    uint il = lane >> 3u;       // 0..3
+    uint ib = lane & 7u;        // 0..7
+
+    uint q3_base = qs_base + 8u * ib;
+    uint q0 = load_u8(q3_base + 2u * il + 0u);
+    uint q1 = load_u8(q3_base + 2u * il + 1u);
+
+    // The final 32 bytes of qs are 8 x uint32 auxiliary words.
+    uint aux_off = qs_base + 64u + 4u * ib;
+    uint aux32 = load_u32(aux_off);
+
+    float d = d0 * (0.5 + float(aux32 >> 28u)) * 0.5;
+
+    uint sign_index = (aux32 >> (7u * il)) & 127u;
+    uint signs = sign_table[sign_index] & 0xffu;
+
+    uint g0 = grid_table[q0];
+    uint g1 = grid_table[q1];
+
+    uint out_base = block * 256u + 32u * ib + 8u * il;
+
+    for (uint j = 0u; j < 4u; ++j) {
+        float v0 = d * float(grid_byte(g0, j));
+        float v1 = d * float(grid_byte(g1, j));
+
+        if ((signs & (1u << j)) != 0u) {
+            v0 = -v0;
+        }
+        if ((signs & (1u << (j + 4u))) != 0u) {
+            v1 = -v1;
+        }
+
+        out_values[out_base + j] = v0;
+        out_values[out_base + j + 4u] = v1;
+    }
+}

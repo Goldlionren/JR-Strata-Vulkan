@@ -34,6 +34,7 @@ jr_compile_shader(jr_vk_read_scalar_shader host_read_scalar.comp)
 jr_compile_shader(jr_vk_read_vec4_shader host_read_vec4.comp)
 jr_compile_shader(jr_vk_read_u2_shader host_read_uvec4x2.comp)
 jr_compile_shader(jr_vk_read_u4_shader host_read_uvec4x4.comp)
+jr_compile_shader(jr_vk_iq3xxs_shader iq3_xxs_dequant.comp)
 
 add_library(jr_vk_runtime STATIC
     src/vk_context.cpp
@@ -75,3 +76,20 @@ target_compile_definitions(jr-vk-memprobe-v04 PRIVATE
     JR_VK_READ_U4_SHADER="${jr_vk_read_u4_shader_SPV}"
 )
 target_compile_options(jr-vk-memprobe-v04 PRIVATE -Wall -Wextra -Wpedantic)
+
+# V1.0: first real model-format kernel.
+add_executable(jr-vk-iq3xxs-parity
+    src/iq3xxs_parity.cpp
+)
+add_dependencies(jr-vk-iq3xxs-parity jr_vk_iq3xxs_shader)
+target_link_libraries(jr-vk-iq3xxs-parity PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-iq3xxs-parity PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-iq3xxs-parity PRIVATE
+    JR_VK_IQ3XXS_SHADER="${jr_vk_iq3xxs_shader_SPV}"
+)
+target_compile_options(jr-vk-iq3xxs-parity PRIVATE
+    -Wall -Wextra -Wpedantic
+)
