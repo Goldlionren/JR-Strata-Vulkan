@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "v10_common.glsl"
+layout(local_size_x=256) in;
+layout(constant_id=0) const uint TYPE=0;
+shared float sums[8];
+// The low-rank HC down/injection and alpha/beta projections have few rows and
+// long reductions. One full workgroup per row keeps that reduction parallel.
+void main(){uint t=gl_LocalInvocationID.x,row=gl_WorkGroupID.x;float sum=0;uint base=(p.op==1&&row>=320)?p.i+(row-320)*p.g:p.a+row*p.g;
+ if(TYPE==30||TYPE==1){for(uint i=t*2;i<p.d;i+=512){uint packed=w[base/4+i/2];vec2 weight=TYPE==30?vec2(uintBitsToFloat(packed<<16),uintBitsToFloat(packed&0xffff0000u)):unpackHalf2x16(packed);sum+=weight.x*s[p.b+i]+weight.y*s[p.b+i+1];}}
+ else{for(uint i=t;i<p.d;i+=256)sum+=uintBitsToFloat(w[base/4+i])*s[p.b+i];}
+ sum=subgroupAdd(sum);if(gl_SubgroupInvocationID==0)sums[gl_SubgroupID]=sum;barrier();
+ if(gl_SubgroupID==0){sum=subgroupAdd(t<8?sums[t]:0);if(t==0){if(p.op==1&&row>=320)s[p.j+row-320]=sum;else s[p.c+row]=p.op==1?silu(sum*0.25):sum;}}
+}

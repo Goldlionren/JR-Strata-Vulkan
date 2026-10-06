@@ -56,3 +56,7 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# Versioned V10 B60 runtime example and local crash diagnostic.
+!/strata-vulkan-swift-iq3_xxs.json
+/v10-crash.json

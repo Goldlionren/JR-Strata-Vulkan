@@ -12,6 +12,10 @@ find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 function(jr_compile_shader target_name shader_name)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader_name}")
     set(out "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader_name}.spv")
+    set(shader_dependencies "${src}")
+    if(shader_name MATCHES "^v10_")
+        list(APPEND shader_dependencies "${CMAKE_CURRENT_SOURCE_DIR}/shaders/v10_common.glsl")
+    endif()
     add_custom_command(
         OUTPUT "${out}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
@@ -20,7 +24,7 @@ function(jr_compile_shader target_name shader_name)
                 --target-env vulkan1.3
                 "${src}"
                 -o "${out}"
-        DEPENDS "${src}"
+        DEPENDS ${shader_dependencies}
         COMMENT "Compiling ${shader_name} -> SPIR-V"
         VERBATIM
     )
@@ -348,3 +352,46 @@ target_compile_definitions(jr-vk-routed-engine-v9 PRIVATE
     JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
 )
 target_compile_options(jr-vk-routed-engine-v9 PRIVATE -Wall -Wextra -Wpedantic)
+
+# V10: complete Swift token engine. V8/V9 routed expert shaders stay unchanged.
+foreach(shader v10_dense.comp v10_ops.comp v10_gdn.comp v10_attn.comp v10_qround.comp v10_dense_small.comp v10_router.comp v10_hc.comp)
+    string(REPLACE ".comp" "" name "${shader}")
+    jr_compile_shader(jr_vk_${name}_shader ${shader})
+endforeach()
+
+add_executable(jr-vk-runtime-v10 src/runtime_v10.cpp)
+target_link_libraries(jr-vk-runtime-v10 PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-runtime-v10 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml")
+add_dependencies(jr-vk-runtime-v10
+    jr_vk_v10_dense_shader jr_vk_v10_ops_shader jr_vk_v10_gdn_shader jr_vk_v10_attn_shader jr_vk_v10_qround_shader jr_vk_v10_dense_small_shader jr_vk_v10_router_shader jr_vk_v10_hc_shader
+    jr_vk_q8_quant_shader jr_vk_v5_grouped_swiglu_shader jr_vk_v5_combine_shader
+    jr_vk_v8_t16_shader jr_vk_v8_t17_shader jr_vk_v8_t18_shader
+    jr_vk_v8_t20_shader jr_vk_v8_t21_shader jr_vk_v8_t22_shader jr_vk_v8_t42_shader)
+target_compile_definitions(jr-vk-runtime-v10 PRIVATE
+    JR_VK_V10_DENSE_SHADER="${jr_vk_v10_dense_shader_SPV}"
+    JR_VK_V10_QROUND_SHADER="${jr_vk_v10_qround_shader_SPV}"
+    JR_VK_V10_SMALL_SHADER="${jr_vk_v10_dense_small_shader_SPV}"
+    JR_VK_V10_ROUTER_SHADER="${jr_vk_v10_router_shader_SPV}"
+    JR_VK_V10_HC_SHADER="${jr_vk_v10_hc_shader_SPV}"
+    JR_VK_V10_OPS_SHADER="${jr_vk_v10_ops_shader_SPV}"
+    JR_VK_V10_GDN_SHADER="${jr_vk_v10_gdn_shader_SPV}"
+    JR_VK_V10_ATTN_SHADER="${jr_vk_v10_attn_shader_SPV}"
+    JR_VK_Q8_QUANT_SHADER="${jr_vk_q8_quant_shader_SPV}"
+    JR_VK_V5_GROUPED_SWIGLU_SHADER="${jr_vk_v5_grouped_swiglu_shader_SPV}"
+    JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
+    JR_VK_V8_T16_SHADER="${jr_vk_v8_t16_shader_SPV}"
+    JR_VK_V8_T17_SHADER="${jr_vk_v8_t17_shader_SPV}"
+    JR_VK_V8_T18_SHADER="${jr_vk_v8_t18_shader_SPV}"
+    JR_VK_V8_T20_SHADER="${jr_vk_v8_t20_shader_SPV}"
+    JR_VK_V8_T21_SHADER="${jr_vk_v8_t21_shader_SPV}"
+    JR_VK_V8_T22_SHADER="${jr_vk_v8_t22_shader_SPV}"
+    JR_VK_V8_T42_SHADER="${jr_vk_v8_t42_shader_SPV}"
+    JR_V10_FRONTEND="${CMAKE_CURRENT_SOURCE_DIR}/../tools/vulkan_runtime_v10.py")
+add_executable(jr-vk-server-v10 src/server_v10.cpp)
+add_dependencies(jr-vk-server-v10 jr-vk-runtime-v10)
+target_compile_definitions(jr-vk-server-v10 PRIVATE
+    JR_V10_FRONTEND="${CMAKE_CURRENT_SOURCE_DIR}/../tools/vulkan_runtime_v10.py")
+
+target_compile_options(jr-vk-runtime-v10 PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)

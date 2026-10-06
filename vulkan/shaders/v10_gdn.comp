@@ -1,0 +1,14 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "v10_common.glsl"
+layout(local_size_x=128) in;
+// Column-major contracted rows: [head,column,row]. Each subgroup owns one
+// column with four register shards, and all state loads/stores are coalesced.
+void main(){uint lane=gl_SubgroupInvocationID,h=gl_WorkGroupID.y,j=gl_WorkGroupID.x*4+gl_SubgroupID,qh=h%16;
+ float v[4],kr[4],qr[4],dotv=0;float dec=s[p.c+h],beta=s[p.d+h];uint base=p.e+(h*128+j)*128;
+ for(uint r=0;r<4;r++){uint i=r*32+lane;v[r]=st[base+i];kr[r]=s[p.a+2048+qh*128+i];qr[r]=s[p.a+qh*128+i];dotv+=v[r]*kr[r];}
+ float delta=(s[p.a+4096+h*128+j]-dec*subgroupAdd(dotv))*beta;float outputv=0;
+ for(uint r=0;r<4;r++){v[r]=v[r]*dec+kr[r]*delta;outputv+=v[r]*qr[r];st[base+r*32+lane]=v[r];}
+ float result=subgroupAdd(outputv);if(lane==0)s[p.b+h*128+j]=result*inversesqrt(128.0);
+}

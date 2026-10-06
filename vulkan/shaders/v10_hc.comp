@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "v10_common.glsl"
+layout(local_size_x=128) in;
+// One subgroup owns all four streams of a coordinate. Eight lanes reduce each
+// stream, then subgroup shuffles mix the four values without shared barriers.
+void main(){uint lane=gl_SubgroupInvocationID,stream=lane/8,sub=lane&7,d=gl_WorkGroupID.x*4+gl_SubgroupID;
+ uint base=p.a+(stream*2560+d)*640;float sum=0;
+ for(uint i=sub*2;i<320;i+=16){uint packed=w[base/4+i/2];sum+=uintBitsToFloat(packed<<16)*s[p.b+i]+uintBitsToFloat(packed&0xffff0000u)*s[p.b+i+1];}
+ sum+=subgroupShuffleXor(sum,4);sum+=subgroupShuffleXor(sum,2);sum+=subgroupShuffleXor(sum,1);
+ float value=s[p.d+stream*2560+d]*sigmoid(sum);
+ float mixed=((subgroupShuffle(value,0)+subgroupShuffle(value,8))+subgroupShuffle(value,16))+subgroupShuffle(value,24);
+ if(lane==0)s[p.c+d]=mixed*0.25;
+}
