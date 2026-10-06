@@ -36,6 +36,11 @@ jr_compile_shader(jr_vk_read_u2_shader host_read_uvec4x2.comp)
 jr_compile_shader(jr_vk_read_u4_shader host_read_uvec4x4.comp)
 jr_compile_shader(jr_vk_iq3xxs_shader iq3_xxs_dequant.comp)
 
+# V2 full-expert path.
+jr_compile_shader(jr_vk_expert_dequant_shader expert_dequant.comp)
+jr_compile_shader(jr_vk_expert_gemv_shader expert_gemv.comp)
+jr_compile_shader(jr_vk_expert_swiglu_shader expert_swiglu.comp)
+
 add_library(jr_vk_runtime STATIC
     src/vk_context.cpp
 )
@@ -77,10 +82,7 @@ target_compile_definitions(jr-vk-memprobe-v04 PRIVATE
 )
 target_compile_options(jr-vk-memprobe-v04 PRIVATE -Wall -Wextra -Wpedantic)
 
-# V1.0: first real model-format kernel.
-add_executable(jr-vk-iq3xxs-parity
-    src/iq3xxs_parity.cpp
-)
+add_executable(jr-vk-iq3xxs-parity src/iq3xxs_parity.cpp)
 add_dependencies(jr-vk-iq3xxs-parity jr_vk_iq3xxs_shader)
 target_link_libraries(jr-vk-iq3xxs-parity PRIVATE jr_vk_runtime)
 target_include_directories(jr-vk-iq3xxs-parity PRIVATE
@@ -90,6 +92,23 @@ target_include_directories(jr-vk-iq3xxs-parity PRIVATE
 target_compile_definitions(jr-vk-iq3xxs-parity PRIVATE
     JR_VK_IQ3XXS_SHADER="${jr_vk_iq3xxs_shader_SPV}"
 )
-target_compile_options(jr-vk-iq3xxs-parity PRIVATE
-    -Wall -Wextra -Wpedantic
+target_compile_options(jr-vk-iq3xxs-parity PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(jr-vk-full-expert
+    src/full_expert.cpp
 )
+add_dependencies(jr-vk-full-expert
+    jr_vk_expert_dequant_shader
+    jr_vk_expert_gemv_shader
+    jr_vk_expert_swiglu_shader
+)
+target_link_libraries(jr-vk-full-expert PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-full-expert PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-full-expert PRIVATE
+    JR_VK_EXPERT_DEQUANT_SHADER="${jr_vk_expert_dequant_shader_SPV}"
+    JR_VK_EXPERT_GEMV_SHADER="${jr_vk_expert_gemv_shader_SPV}"
+    JR_VK_EXPERT_SWIGLU_SHADER="${jr_vk_expert_swiglu_shader_SPV}"
+)
+target_compile_options(jr-vk-full-expert PRIVATE -Wall -Wextra -Wpedantic)

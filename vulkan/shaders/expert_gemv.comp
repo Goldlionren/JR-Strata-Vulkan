@@ -1,0 +1,45 @@
+#version 460
+
+// Correctness-first F32 GEMV.
+// Matrix is row-major [rows][cols]. One workgroup computes one output row.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Matrix {
+    float w[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer Vector {
+    float x[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer Output {
+    float y[];
+};
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+shared float partial[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    uint base = row * pc.cols;
+    float acc = 0.0;
+    for (uint c = lid; c < pc.cols; c += 256u) {
+        acc += w[base + c] * x[c];
+    }
+
+    partial[lid] = acc;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) partial[lid] += partial[lid + s];
+        barrier();
+    }
+
+    if (lid == 0u) y[row] = partial[0];
+}
