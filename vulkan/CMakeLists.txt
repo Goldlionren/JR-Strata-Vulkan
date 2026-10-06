@@ -308,3 +308,43 @@ target_compile_definitions(jr-vk-routed-engine-v8 PRIVATE
     JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
 )
 target_compile_options(jr-vk-routed-engine-v8 PRIVATE -Wall -Wextra -Wpedantic)
+
+
+# V9: profile-driven production cache policy / routed execution.
+#
+# V9 keeps V8's format-specialized Xe2 kernels and adds a whole-model
+# residency plan derived from Strata expert-profile.bin + native_experts.txt.
+# The route bundle no longer decides VRAM/RAM placement: the engine resolves
+# every routed (layer, expert) through the V9 residency table.
+add_executable(jr-vk-routed-engine-v9
+    src/routed_engine_v9.cpp
+)
+add_dependencies(jr-vk-routed-engine-v9
+    jr_vk_q8_quant_shader
+    jr_vk_v8_t16_shader
+    jr_vk_v8_t17_shader
+    jr_vk_v8_t18_shader
+    jr_vk_v8_t20_shader
+    jr_vk_v8_t21_shader
+    jr_vk_v8_t22_shader
+    jr_vk_v8_t42_shader
+    jr_vk_v5_grouped_swiglu_shader
+    jr_vk_v5_combine_shader
+)
+target_link_libraries(jr-vk-routed-engine-v9 PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-routed-engine-v9 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml"
+)
+target_compile_definitions(jr-vk-routed-engine-v9 PRIVATE
+    JR_VK_Q8_QUANT_SHADER="${jr_vk_q8_quant_shader_SPV}"
+    JR_VK_V8_T16_SHADER="${jr_vk_v8_t16_shader_SPV}"
+    JR_VK_V8_T17_SHADER="${jr_vk_v8_t17_shader_SPV}"
+    JR_VK_V8_T18_SHADER="${jr_vk_v8_t18_shader_SPV}"
+    JR_VK_V8_T20_SHADER="${jr_vk_v8_t20_shader_SPV}"
+    JR_VK_V8_T21_SHADER="${jr_vk_v8_t21_shader_SPV}"
+    JR_VK_V8_T22_SHADER="${jr_vk_v8_t22_shader_SPV}"
+    JR_VK_V8_T42_SHADER="${jr_vk_v8_t42_shader_SPV}"
+    JR_VK_V5_GROUPED_SWIGLU_SHADER="${jr_vk_v5_grouped_swiglu_shader_SPV}"
+    JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
+)
+target_compile_options(jr-vk-routed-engine-v9 PRIVATE -Wall -Wextra -Wpedantic)
