@@ -13,8 +13,15 @@ function(jr_compile_shader target_name shader_name)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader_name}")
     set(out "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader_name}.spv")
     set(shader_dependencies "${src}")
-    if(shader_name MATCHES "^v10_")
-        list(APPEND shader_dependencies "${CMAKE_CURRENT_SOURCE_DIR}/shaders/v10_common.glsl")
+    if(shader_name MATCHES "^v(10|11)_")
+        if(shader_name MATCHES "^v11_expert_t")
+            list(APPEND shader_dependencies "${CMAKE_CURRENT_SOURCE_DIR}/shaders/v11_expert_batch.glsl")
+        endif()
+        if(shader_name MATCHES "^v11_")
+            list(APPEND shader_dependencies "${CMAKE_CURRENT_SOURCE_DIR}/shaders/v11_common.glsl")
+        else()
+            list(APPEND shader_dependencies "${CMAKE_CURRENT_SOURCE_DIR}/shaders/v10_common.glsl")
+        endif()
     endif()
     add_custom_command(
         OUTPUT "${out}"
@@ -395,3 +402,159 @@ target_compile_definitions(jr-vk-server-v10 PRIVATE
     JR_V10_FRONTEND="${CMAKE_CURRENT_SOURCE_DIR}/../tools/vulkan_runtime_v10.py")
 
 target_compile_options(jr-vk-runtime-v10 PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+
+# V11 has independent shader artifacts, preserving the frozen V10 executable.
+foreach(shader v11_dense.comp v11_ops.comp v11_gdn.comp v11_attn.comp v11_qround.comp v11_dense_small.comp v11_router.comp v11_hc.comp v11_dense_batch.comp v11_gdn_batch.comp v11_dense_small_batch.comp)
+    string(REPLACE ".comp" "" name "${shader}")
+    jr_compile_shader(jr_vk_${name}_shader ${shader})
+endforeach()
+add_executable(jr-vk-runtime-v11 src/runtime_v11.cpp)
+target_link_libraries(jr-vk-runtime-v11 PRIVATE jr_vk_runtime)
+target_include_directories(jr-vk-runtime-v11 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/ggml")
+add_dependencies(jr-vk-runtime-v11
+    jr_vk_v11_dense_batch_shader jr_vk_v11_gdn_batch_shader jr_vk_v11_dense_small_batch_shader
+    jr_vk_v11_dense_shader jr_vk_v11_ops_shader jr_vk_v11_gdn_shader jr_vk_v11_attn_shader jr_vk_v11_qround_shader jr_vk_v11_dense_small_shader jr_vk_v11_router_shader jr_vk_v11_hc_shader
+    jr_vk_q8_quant_shader jr_vk_v5_grouped_swiglu_shader jr_vk_v5_combine_shader
+    jr_vk_v8_t16_shader jr_vk_v8_t17_shader jr_vk_v8_t18_shader
+    jr_vk_v8_t20_shader jr_vk_v8_t21_shader jr_vk_v8_t22_shader jr_vk_v8_t42_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE
+    JR_V11_SMALL_BATCH_SHADER="${jr_vk_v11_dense_small_batch_shader_SPV}"
+    JR_V11_DENSE_BATCH_SHADER="${jr_vk_v11_dense_batch_shader_SPV}"
+    JR_V11_GDN_BATCH_SHADER="${jr_vk_v11_gdn_batch_shader_SPV}"
+    JR_VK_V10_DENSE_SHADER="${jr_vk_v11_dense_shader_SPV}"
+    JR_VK_V10_QROUND_SHADER="${jr_vk_v11_qround_shader_SPV}"
+    JR_VK_V10_SMALL_SHADER="${jr_vk_v11_dense_small_shader_SPV}"
+    JR_VK_V10_ROUTER_SHADER="${jr_vk_v11_router_shader_SPV}"
+    JR_VK_V10_HC_SHADER="${jr_vk_v11_hc_shader_SPV}"
+    JR_VK_V10_OPS_SHADER="${jr_vk_v11_ops_shader_SPV}"
+    JR_VK_V10_GDN_SHADER="${jr_vk_v11_gdn_shader_SPV}"
+    JR_VK_V10_ATTN_SHADER="${jr_vk_v11_attn_shader_SPV}"
+    JR_VK_Q8_QUANT_SHADER="${jr_vk_q8_quant_shader_SPV}"
+    JR_VK_V5_GROUPED_SWIGLU_SHADER="${jr_vk_v5_grouped_swiglu_shader_SPV}"
+    JR_VK_V5_COMBINE_SHADER="${jr_vk_v5_combine_shader_SPV}"
+    JR_VK_V8_T16_SHADER="${jr_vk_v8_t16_shader_SPV}"
+    JR_VK_V8_T17_SHADER="${jr_vk_v8_t17_shader_SPV}"
+    JR_VK_V8_T18_SHADER="${jr_vk_v8_t18_shader_SPV}"
+    JR_VK_V8_T20_SHADER="${jr_vk_v8_t20_shader_SPV}"
+    JR_VK_V8_T21_SHADER="${jr_vk_v8_t21_shader_SPV}"
+    JR_VK_V8_T22_SHADER="${jr_vk_v8_t22_shader_SPV}"
+    JR_VK_V8_T42_SHADER="${jr_vk_v8_t42_shader_SPV}"
+    JR_V11_FRONTEND="${CMAKE_CURRENT_SOURCE_DIR}/../tools/vulkan_runtime_v11.py")
+add_executable(jr-vk-server-v11 src/server_v11.cpp)
+add_dependencies(jr-vk-server-v11 jr-vk-runtime-v11)
+target_compile_definitions(jr-vk-server-v11 PRIVATE
+    JR_V11_FRONTEND="${CMAKE_CURRENT_SOURCE_DIR}/../tools/vulkan_runtime_v11.py")
+
+target_compile_options(jr-vk-runtime-v11 PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+
+# V11 groups duplicate routes only within a target window; V9 remains unchanged.
+jr_compile_shader(jr_vk_v11_expert_t16_shader v11_expert_t16.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_expert_t16_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT_T16_SHADER="${jr_vk_v11_expert_t16_shader_SPV}")
+jr_compile_shader(jr_vk_v11_expert_t17_shader v11_expert_t17.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_expert_t17_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT_T17_SHADER="${jr_vk_v11_expert_t17_shader_SPV}")
+jr_compile_shader(jr_vk_v11_expert_t18_shader v11_expert_t18.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_expert_t18_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT_T18_SHADER="${jr_vk_v11_expert_t18_shader_SPV}")
+jr_compile_shader(jr_vk_v11_expert_t20_shader v11_expert_t20.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_expert_t20_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT_T20_SHADER="${jr_vk_v11_expert_t20_shader_SPV}")
+jr_compile_shader(jr_vk_v11_expert_t21_shader v11_expert_t21.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_expert_t21_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT_T21_SHADER="${jr_vk_v11_expert_t21_shader_SPV}")
+jr_compile_shader(jr_vk_v11_expert_t22_shader v11_expert_t22.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_expert_t22_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT_T22_SHADER="${jr_vk_v11_expert_t22_shader_SPV}")
+jr_compile_shader(jr_vk_v11_expert_t42_shader v11_expert_t42.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_expert_t42_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT_T42_SHADER="${jr_vk_v11_expert_t42_shader_SPV}")
+jr_compile_shader(jr_vk_v11_expert_group_shader v11_expert_group.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_expert_group_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT_GROUP_SHADER="${jr_vk_v11_expert_group_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_hc_batch_shader v11_hc_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_hc_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_HC_BATCH_SHADER="${jr_vk_v11_hc_batch_shader_SPV}")
+
+add_executable(jr-v11-hc-check ../tools/vulkan_v11_hc_check.cpp)
+target_link_libraries(jr-v11-hc-check PRIVATE jr_vk_runtime)
+target_include_directories(jr-v11-hc-check PRIVATE src ../include ../third_party/ggml)
+target_compile_options(jr-v11-hc-check PRIVATE -Wno-missing-field-initializers)
+add_dependencies(jr-v11-hc-check jr_vk_v11_ops_shader)
+target_compile_definitions(jr-v11-hc-check PRIVATE JR_HC_OPS="${jr_vk_v11_ops_shader_SPV}")
+add_dependencies(jr-v11-hc-check jr_vk_v11_dense_small_shader)
+target_compile_definitions(jr-v11-hc-check PRIVATE JR_HC_SMALL="${jr_vk_v11_dense_small_shader_SPV}")
+add_dependencies(jr-v11-hc-check jr_vk_v11_hc_shader)
+target_compile_definitions(jr-v11-hc-check PRIVATE JR_HC_UP="${jr_vk_v11_hc_shader_SPV}")
+add_dependencies(jr-v11-hc-check jr_vk_v11_dense_small_batch_shader)
+target_compile_definitions(jr-v11-hc-check PRIVATE JR_HC_BATCH_DOWN="${jr_vk_v11_dense_small_batch_shader_SPV}")
+add_dependencies(jr-v11-hc-check jr_vk_v11_hc_batch_shader)
+target_compile_definitions(jr-v11-hc-check PRIVATE JR_HC_BATCH_UP="${jr_vk_v11_hc_batch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_mtp_attn_shader v11_mtp_attn.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_mtp_attn_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_MTP_ATTN_SHADER="${jr_vk_v11_mtp_attn_shader_SPV}")
+
+
+# Batch independent frame normalization and Q8 rounding without changing arithmetic.
+jr_compile_shader(jr_vk_v11_norm_batch_shader v11_norm_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_norm_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_NORM_BATCH_SHADER="${jr_vk_v11_norm_batch_shader_SPV}")
+jr_compile_shader(jr_vk_v11_qround_batch_shader v11_qround_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_qround_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_QROUND_BATCH_SHADER="${jr_vk_v11_qround_batch_shader_SPV}")
+add_dependencies(jr-v11-hc-check jr_vk_v11_norm_batch_shader)
+target_compile_definitions(jr-v11-hc-check PRIVATE JR_HC_BATCH_NORM="${jr_vk_v11_norm_batch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_gdn_prepare_batch_shader v11_gdn_prepare_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_gdn_prepare_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_GDN_PREPARE_BATCH_SHADER="${jr_vk_v11_gdn_prepare_batch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_qsa_ops_batch_shader v11_qsa_ops_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_qsa_ops_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_QSA_OPS_BATCH_SHADER="${jr_vk_v11_qsa_ops_batch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_attn_batch_shader v11_attn_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_attn_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_ATTN_BATCH_SHADER="${jr_vk_v11_attn_batch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_router_batch_shader v11_router_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_router_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_ROUTER_BATCH_SHADER="${jr_vk_v11_router_batch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_swiglu_batch_shader v11_swiglu_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_swiglu_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_SWIGLU_BATCH_SHADER="${jr_vk_v11_swiglu_batch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_combine_batch_shader v11_combine_batch.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_combine_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_COMBINE_BATCH_SHADER="${jr_vk_v11_combine_batch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_attn_tile_shader v11_attn_tile.comp)
+add_executable(jr-v11-attention-check ../tools/vulkan_v11_attention_check.cpp)
+target_link_libraries(jr-v11-attention-check PRIVATE jr_vk_runtime)
+target_include_directories(jr-v11-attention-check PRIVATE src ../include ../third_party/ggml)
+target_compile_options(jr-v11-attention-check PRIVATE -Wno-missing-field-initializers)
+add_dependencies(jr-v11-attention-check jr_vk_v11_attn_batch_shader jr_vk_v11_attn_tile_shader)
+target_compile_definitions(jr-v11-attention-check PRIVATE
+    JR_ATTN_REFERENCE="${jr_vk_v11_attn_batch_shader_SPV}"
+    JR_ATTN_TILE="${jr_vk_v11_attn_tile_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_qsa_select_batch_shader v11_qsa_select_batch.comp)
+add_dependencies(jr-v11-attention-check jr_vk_v11_qsa_select_batch_shader jr_vk_v11_ops_shader)
+target_compile_definitions(jr-v11-attention-check PRIVATE JR_QSA_REFERENCE_OPS="${jr_vk_v11_ops_shader_SPV}" JR_QSA_SELECT="${jr_vk_v11_qsa_select_batch_shader_SPV}")
+
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_qsa_select_batch_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_QSA_SELECT_BATCH_SHADER="${jr_vk_v11_qsa_select_batch_shader_SPV}")
+
+add_executable(jr-v11-expert-check ../tools/vulkan_v11_expert_check.cpp)
+target_link_libraries(jr-v11-expert-check PRIVATE jr_vk_runtime)
+target_include_directories(jr-v11-expert-check PRIVATE src ../include ../third_party/ggml)
+target_compile_options(jr-v11-expert-check PRIVATE -Wno-missing-field-initializers)
+foreach(type 16 17 18 20 21 22 42)
+    add_dependencies(jr-v11-expert-check jr_vk_v11_expert_t${type}_shader)
+    target_compile_definitions(jr-v11-expert-check PRIVATE JR_TEST_T${type}="${jr_vk_v11_expert_t${type}_shader_SPV}")
+endforeach()

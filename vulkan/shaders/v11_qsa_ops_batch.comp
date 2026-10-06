@@ -1,0 +1,17 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "v11_common.glsl"
+layout(local_size_x=256) in;
+// Independent frame operations, with unchanged reference arithmetic.
+void main(){uint idx=gl_GlobalInvocationID.x,frame=gl_WorkGroupID.y*p.l,control=gl_WorkGroupID.y*p.k;
+ if(p.op==8){ // query/gate split, one head per 512 source elements
+  if(idx<6144)s[frame+p.b+idx]=s[frame+p.a+(idx/256)*512+idx%256];
+ }else if(p.op==9){ // NEOX rotation, first 64 dimensions only
+  if(idx<p.c*32){uint head=idx/32,i=idx%32;float ang=float(ctl[control+0])*pow(1e7,-float(2*i)/64),co=cos(ang),si=sin(ang);
+   uint o=p.a+head*p.b+i;float a=s[frame+o],b=s[frame+o+32];s[frame+o]=a*co-b*si;s[frame+o+32]=a*si+b*co;}
+ }else if(p.op==10){ // FP16 KV append. One invocation owns both halves of a uint.
+  if(idx<256){uint at=ctl[control+0]*512+idx*2;kv[p.c+at/2]=packHalf2x16(vec2(s[frame+p.a+idx*2],s[frame+p.a+idx*2+1]));kv[p.c+p.d*256+at/2]=packHalf2x16(vec2(s[frame+p.b+idx*2],s[frame+p.b+idx*2+1]));}
+ }else if(p.op==14){ // attention gate; round to FP16 as the reference output projection does
+  if(idx<6144)s[frame+p.c+idx]=unpackHalf2x16(packHalf2x16(vec2(s[frame+p.a+idx]*sigmoid(s[frame+p.b+(idx/256)*512+256+idx%256]),0))).x;
+ }
+}

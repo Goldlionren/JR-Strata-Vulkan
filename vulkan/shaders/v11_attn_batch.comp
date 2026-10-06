@@ -1,0 +1,45 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "v11_common.glsl"
+layout(local_size_x=256) in;
+shared float red[256];shared float weights[65];shared float combined_max;shared float combined_sum;
+// One group per query head and 32-cell split. Stable local softmax, combine in second op.
+uint frame_index(){return p.op==0?gl_WorkGroupID.z:gl_WorkGroupID.y;}
+float kvget(uint at){vec2 v=unpackHalf2x16(kv[at/2]);return (at%2)==0?v.x:v.y;}
+void grouped_attention(){uint lane=gl_SubgroupInvocationID;uint h=gl_WorkGroupID.x*8+gl_SubgroupID,split=gl_WorkGroupID.y,count=min(ctl[frame_index()*p.k+0]+1,2051),begin=split*32;
+  if(begin>=count)return;uint cells=min(32,count-begin);float query[8],acc[8];
+  for(uint k=0;k<8;k++){query[k]=s[frame_index()*p.l+p.a+h*256+lane+k*32];acc[k]=0;}
+  float ownscore=-3.402823e38;
+  for(uint t=0;t<cells;t++){uint id=floatBitsToUint(s[frame_index()*p.l+p.c+begin+t]);float z=0;
+   for(uint k=0;k<8;k++)z+=query[k]*kvget(p.d*2+id*512+(h/12)*256+lane+k*32);
+   float score=subgroupAdd(z)/16;if(lane==t)ownscore=score;}
+  float maximum=subgroupMax(ownscore),weight=exp(ownscore-maximum),sum=subgroupAdd(weight);
+  for(uint t=0;t<cells;t++){uint id=floatBitsToUint(s[frame_index()*p.l+p.c+begin+t]);float wt=subgroupShuffle(weight,t);
+   for(uint k=0;k<8;k++)acc[k]+=wt*kvget(p.d*2+p.e*512+id*512+(h/12)*256+lane+k*32);}
+  uint base=p.b+(h*65+split)*258;for(uint k=0;k<8;k++)s[frame_index()*p.l+base+lane+k*32]=acc[k];if(lane==0){s[frame_index()*p.l+base+256]=maximum;s[frame_index()*p.l+base+257]=sum;}
+
+}
+void main(){uint d=gl_LocalInvocationID.x,h=gl_WorkGroupID.x,split=gl_WorkGroupID.y;
+ if(p.op==0&&ctl[frame_index()*p.k+0]>=512){if(gl_WorkGroupID.x<3)grouped_attention();return;}
+ if(p.op==0){uint count=min(ctl[frame_index()*p.k+0]+1,2051),begin=split*32;if(begin>=count)return;
+  for(uint tile=0;tile<32;tile+=8){uint cell=begin+tile+gl_SubgroupID;float dotv=0;
+   if(cell<count){uint id=floatBitsToUint(s[frame_index()*p.l+p.c+cell]);for(uint x=gl_SubgroupInvocationID;x<256;x+=32)dotv+=s[frame_index()*p.l+p.a+h*256+x]*kvget(p.d*2+id*512+(h/12)*256+x);}
+   float score=subgroupAdd(dotv)/16;if(gl_SubgroupInvocationID==0)weights[tile+gl_SubgroupID]=cell<count?score:-3.402823e38;
+  }
+  barrier();uint base=p.b+(h*65+split)*258;
+  // Scores and softmax factors are common to all 256 value coordinates.
+  if(d<32){float maximum=subgroupMax(weights[d]);float wt=exp(weights[d]-maximum);weights[d]=wt;float sum=subgroupAdd(wt);
+   if(d==0){s[frame_index()*p.l+base+256]=maximum;s[frame_index()*p.l+base+257]=sum;}}
+  barrier();float acc=0;
+  for(uint t=0;t<32&&begin+t<count;t++){uint id=floatBitsToUint(s[frame_index()*p.l+p.c+begin+t]);acc+=weights[t]*kvget(p.d*2+p.e*512+id*512+(h/12)*256+d);}
+  s[frame_index()*p.l+base+d]=acc;
+ }else{uint ns=(min(ctl[frame_index()*p.k+0]+1,2051)+31)/32;
+  if(d==0){float mx=-3.402823e38;for(uint t=0;t<ns;t++)mx=max(mx,s[frame_index()*p.l+p.a+(h*65+t)*258+256]);combined_max=mx;}barrier();
+  float contribution=0;if(d<ns){uint base=p.a+(h*65+d)*258;weights[d]=exp(s[frame_index()*p.l+base+256]-combined_max);contribution=s[frame_index()*p.l+base+257]*weights[d];}
+  float sum=subgroupAdd(contribution);if(gl_SubgroupInvocationID==0)red[gl_SubgroupID]=sum;barrier();
+  if(gl_SubgroupID==0){sum=subgroupAdd(d<8?red[d]:0);if(d==0)combined_sum=sum;}barrier();
+  float acc=0;for(uint t=0;t<ns;t++)acc+=s[frame_index()*p.l+p.a+(h*65+t)*258+d]*weights[t];s[frame_index()*p.l+p.b+h*256+d]=acc/combined_sum;
+ }
+}

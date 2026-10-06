@@ -1,0 +1,16 @@
+{
+  "pack": "/data/strata-lab/data/packs/swift-iq3_xxs",
+  "native": "/data/strata-lab/data/models/swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "ple_gguf": "/data/strata-lab/data/models/swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "residency": "/data/strata-lab/JR-Strata-Vulkan/data/v10-cache-plan.bin",
+  "max_context": 8192,
+  "kv": "fp16",
+  "model": "swift-iq3_xxs-vulkan",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "stats_every": 128,
+  "mtp": "/data/strata-lab/data/mtp/rt",
+  "spec": 4,
+  "spec_min_p": 0.5,
+  "checks": true
+}

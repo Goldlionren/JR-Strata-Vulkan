@@ -1,0 +1,15 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "v11_common.glsl"
+layout(local_size_x=32) in;
+// A Q8_1 block fits one subgroup. No shared-memory tree or workgroup barriers.
+void main(){uint lane=gl_SubgroupInvocationID,b=gl_WorkGroupID.x;float x=s[p.a+b*32+lane];
+ finite_value(x);
+ float scale=min(subgroupMax(abs(x))/127,65504),z=scale==0?0:x/scale;
+ int q=int(clamp(sign(z)*floor(abs(z)+0.5),-127,127));float total=subgroupAdd(x);
+ uint at=(lane&7)*4;uint packed=(uint(subgroupShuffle(q,at))&255)|((uint(subgroupShuffle(q,at+1))&255)<<8)|((uint(subgroupShuffle(q,at+2))&255)<<16)|((uint(subgroupShuffle(q,at+3))&255)<<24);
+ if(lane==0)s[p.b+b*9]=uintBitsToFloat(packHalf2x16(vec2(scale,clamp(total,-65504,65504))));
+ if(lane<8)s[p.b+b*9+lane+1]=uintBitsToFloat(packed);
+}

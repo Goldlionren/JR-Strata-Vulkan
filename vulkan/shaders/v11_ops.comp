@@ -1,0 +1,103 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "v11_common.glsl"
+layout(local_size_x=256) in;
+shared float mins[8];shared float maxs[8];shared float norms[8];shared float bads[8];shared float red[256];shared float buf[256];shared uint ids[512];shared float logits[512];
+float sum256(float x){
+ float sum=subgroupAdd(x);if(gl_SubgroupInvocationID==0)red[gl_SubgroupID]=sum;barrier();
+ return subgroupAdd(gl_SubgroupInvocationID<8?red[gl_SubgroupInvocationID]:0);
+}
+void main(){uint t=gl_LocalInvocationID.x,idx=gl_GlobalInvocationID.x,row=gl_WorkGroupID.x;
+ if(p.op==0){ // embedding input staged as F32 in control, broadcast to residual streams
+  if(idx<10240){float value=val(p.b,21,ctl[1]*2560+idx%2560);s[p.a+idx]=value;finite_value(value);}
+ }else if(p.op==1||p.op==25){ // RMS or L2 normalization, one workgroup per row
+  uint base=p.a+row*p.d,outb=p.b+row*p.d;float z=0;
+  for(uint i=t;i<p.d;i+=256){float x=s[base+i];if(p.op==25){x+=s[p.h+i]*(2*sigmoid(s[p.i+row]*0.25));s[base+i]=x;}z+=x*x;}
+  float ss=sum256(z);float inv=inversesqrt((p.g==1?ss:ss/float(p.d))+1e-6);
+  for(uint i=t;i<p.d;i+=256){float gamma=p.f==0?1:uintBitsToFloat(w[p.c/4+(p.f==2?row*p.d:0)+i]);s[outb+i]=s[base+i]*inv*gamma;}
+ }else if(p.op==2){ // low rank nonlinearity
+  if(idx<p.c)s[p.a+idx]=silu(s[p.a+idx]/4.0);
+ }else if(p.op==3){ // collapse hyperconnection streams
+  if(idx<2560){float x=0;for(uint c=0;c<4;c++)x+=s[p.a+c*2560+idx]*sigmoid(s[p.b+c*2560+idx]);s[p.c+idx]=x*0.25;}
+ }else if(p.op==4){ // residual scatter
+  if(idx<10240)s[p.a+idx]+=s[p.b+idx%2560]*(2.0*sigmoid(s[p.c+idx/2560]*0.25));
+ }else if(p.op==5){ // depthwise conv and SiLU; state row fastest
+  if(idx<10240){float x=s[p.a+idx],v=0;for(uint k=0;k<3;k++)v+=st[p.c+idx*3+k]*uintBitsToFloat(w[p.d/4+idx*4+k]);
+   v+=x*uintBitsToFloat(w[p.d/4+idx*4+3]);st[p.c+idx*3]=st[p.c+idx*3+1];st[p.c+idx*3+1]=st[p.c+idx*3+2];st[p.c+idx*3+2]=x;s[p.b+idx]=silu(v);}
+ }else if(p.op==6){ // GDN decay and beta
+  if(idx<48){float x=s[p.a+idx]+uintBitsToFloat(w[p.c/4+idx]);float sp=x>20?x:log(1+exp(x));s[p.a+idx]=exp(sp*uintBitsToFloat(w[p.d/4+idx]));s[p.b+idx]=sigmoid(s[p.b+idx]);}
+ }else if(p.op==7){ // GDN output RMS norm, weight shared across heads, sigmoid gate
+  uint base=p.a+row*128;float z=0;for(uint i=t;i<128;i+=256){float x=s[base+i];if(p.op==25){x+=s[p.h+i]*(2*sigmoid(s[p.i+row]*0.25));s[base+i]=x;}z+=x*x;}
+  float inv=inversesqrt(sum256(z)/128+1e-6);if(t<128)s[p.b+row*128+t]=s[base+t]*inv*uintBitsToFloat(w[p.c/4+t])*sigmoid(s[p.d+row*128+t]);
+ }else if(p.op==8){ // query/gate split, one head per 512 source elements
+  if(idx<6144)s[p.b+idx]=s[p.a+(idx/256)*512+idx%256];
+ }else if(p.op==9){ // NEOX rotation, first 64 dimensions only
+  if(idx<p.c*32){uint head=idx/32,i=idx%32;float ang=float(ctl[0])*pow(1e7,-float(2*i)/64),co=cos(ang),si=sin(ang);
+   uint o=p.a+head*p.b+i;float a=s[o],b=s[o+32];s[o]=a*co-b*si;s[o+32]=a*si+b*co;}
+ }else if(p.op==10){ // FP16 KV append. One invocation owns both halves of a uint.
+  if(idx<256){uint at=ctl[0]*512+idx*2;kv[p.c+at/2]=packHalf2x16(vec2(s[p.a+idx*2],s[p.a+idx*2+1]));kv[p.c+p.d*256+at/2]=packHalf2x16(vec2(s[p.b+idx*2],s[p.b+idx*2+1]));}
+ }else if(p.op==11){ // indexer tail; pool 4 raw rows at block boundary; constant spare normalized key
+  uint pos=ctl[0],slot=pos%4;float x=t<128?s[p.a+t]:0;
+  if(t<128&&slot<3)st[p.b+slot*128+t]=x;
+  if(pos==0||slot==3){float mean=x;if(slot==3&&t<128)mean=(st[p.b+t]+st[p.b+128+t]+st[p.b+256+t]+x)*0.25;
+   float inv=inversesqrt(sum256(mean*mean)/128+1e-6);if(t<128)buf[t]=mean*inv*uintBitsToFloat(w[p.c/4+t]);barrier();
+   if(t<128){float outv=buf[t];if(t<64){uint pair=t%32;float a=buf[pair],b=buf[pair+32];float ang=float((pos/4)*4)*pow(1e7,-float(2*pair)/64);outv=t<32?a*cos(ang)-b*sin(ang):a*sin(ang)+b*cos(ang);}
+    if(pos==0)st[p.e+t]=outv;else st[p.d+(pos/4)*128+t]=outv;}}
+ }else if(p.op==12){ // indexer scores: sum relu over 4 query heads, no attention scale
+  uint nb=(ctl[0]+1)/4;if(row>nb)return;float score=0;
+  for(uint h=0;h<4;h++){float dotv=0;for(uint d=t;d<128;d+=256)dotv+=s[p.a+h*128+d]*st[(row==nb?p.c:p.b+row*128)+d];score+=max(sum256(dotv),0);barrier();}
+  if(t==0)s[p.d+row]=score;
+ }else if(p.op==13){ // QSA selection: rank blocks; cell ties ascend. Tail shares spare score.
+  uint nk=ctl[0]+1;if(nk<=2051){if(idx<nk)s[p.c+idx]=uintBitsToFloat(idx);return;}
+  uint nb=nk/4,tail=nk%4;if(idx>nb||(idx==nb&&tail==0))return;
+  float score=s[p.a+idx];uint rank=0;
+  for(uint b=0;b<=nb;b++){uint count=b==nb?tail:4;if(count==0)continue;
+   float z=s[p.a+b];if(z>score||(z==score&&b<idx))rank+=count;}
+  uint count=idx==nb?tail:4;for(uint j=0;j<count;j++)if(rank+j<2051)s[p.c+rank+j]=uintBitsToFloat(idx*4+j);
+ }else if(p.op==14){ // attention gate; round to FP16 as the reference output projection does
+  if(idx<6144)s[p.c+idx]=unpackHalf2x16(packHalf2x16(vec2(s[p.a+idx]*sigmoid(s[p.b+(idx/256)*512+256+idx%256]),0))).x;
+ }else if(p.op==15){ // shared SwiGLU
+  if(idx<640)s[p.c+idx]=silu(s[p.a+idx])*s[p.b+idx];
+ }else if(p.op==16){ // MoE + gated shared expert
+  if(idx<2560){float value=s[p.a+idx]+s[p.b+idx]*sigmoid(s[p.d]);s[p.c+idx]=value;finite_value(value);}
+ }else if(p.op==17){ // PLE dot gate and broadcast value
+  float dotv=0;for(uint d=t;d<2560;d+=256)dotv+=s[p.a+row*2560+d]*s[p.b+row*2560+d];float z=sum256(dotv)/sqrt(2560.0);
+  float gate=sigmoid(sign(z)*sqrt(max(abs(z),1e-6)));for(uint d=t;d<2560;d+=256)s[p.d+row*2560+d]=s[p.c+d]*gate;
+ }else if(p.op==18){ // PLE dilated conv; nine normalized history rows per channel
+  if(idx<10240){float z=0;for(uint k=0;k<4;k++)z+=val(p.d,1,idx*4+k)*(k==3?s[p.b+idx]:st[p.c+idx*9+k*3]);s[p.a+idx]+=s[p.e+idx]+silu(z);finite_value(s[p.a+idx]);
+   for(uint r=0;r<8;r++)st[p.c+idx*9+r]=st[p.c+idx*9+r+1];st[p.c+idx*9+8]=s[p.b+idx];}
+ }else if(p.op==19){ // finite checkpoint: min/max/L2/nonfinite count for a major stage
+  float z=0,mx=-3.402823e38,mn=3.402823e38,bad=0;
+  for(uint i=t;i<p.b;i+=256){float v=p.d==1?st[p.a+i]:s[p.a+i];if(isnan(v)||isinf(v))bad++;else{z+=v*v;mn=min(mn,v);mx=max(mx,v);}}
+  mn=subgroupMin(mn);mx=subgroupMax(mx);z=subgroupAdd(z);bad=subgroupAdd(bad);
+  if(gl_SubgroupInvocationID==0){uint g=gl_SubgroupID;mins[g]=mn;maxs[g]=mx;norms[g]=z;bads[g]=bad;}barrier();
+  if(gl_SubgroupID==0){mn=subgroupMin(t<8?mins[t]:3.402823e38);mx=subgroupMax(t<8?maxs[t]:-3.402823e38);z=subgroupAdd(t<8?norms[t]:0);bad=subgroupAdd(t<8?bads[t]:0);
+   if(t==0){diag[p.c]=mn;diag[p.c+1]=mx;diag[p.c+2]=sqrt(z);diag[p.c+3]=bad;}}
+ }else if(p.op==20){ // staged PLE embedding
+  if(idx<2560)s[p.a+idx]=uintBitsToFloat(ctl[16+2560+idx]);
+ }else if(p.op==21){ // device router: softmax over all 512, stable ranking, normalize selected top10
+  for(uint i=t;i<512;i+=256){logits[i]=s[p.a+i];ids[i]=i;}barrier();
+  for(uint size=2;size<=512;size*=2)for(uint stride=size/2;stride>0;stride/=2){
+   for(uint i=t;i<512;i+=256){uint j=i^stride;if(j>i){bool desc=(i&size)==0;
+    bool before=logits[i]>logits[j]||(logits[i]==logits[j]&&ids[i]<ids[j]);
+    if(before!=desc){float v=logits[i];logits[i]=logits[j];logits[j]=v;uint z=ids[i];ids[i]=ids[j];ids[j]=z;}}}barrier();}
+  float denom=sum256(exp(logits[t]-logits[0])+exp(logits[t+256]-logits[0]));barrier();
+  if(t<10)buf[t]=exp(logits[t]-logits[0])/denom;barrier();float selected=0;for(uint i=0;i<10;i++)selected+=buf[i];
+  if(t<10){rw[t]=buf[t]/selected;for(uint f=0;f<8;f++)meta[t*8+f]=plan[ids[t]*8+f];diag[p.b+t]=uintBitsToFloat(ids[t]);}
+ }else if(p.op==22){ // greedy sampler, ascending ID on ties
+  float best=-3.402823e38;uint id=0;
+  for(uint i=t;i<p.b;i+=256){float v=s[p.a+i];if(v>best||(v==best&&i<id)){best=v;id=i;}}
+  red[t]=best;buf[t]=uintBitsToFloat(id);barrier();
+  for(uint k=128;k>0;k>>=1){if(t<k){float v=red[t+k];uint other=floatBitsToUint(buf[t+k]);if(v>red[t]||(v==red[t]&&other<floatBitsToUint(buf[t]))){red[t]=v;buf[t]=uintBitsToFloat(other);}}barrier();}
+  if(p.m!=0){float top=red[0];barrier();float z=0;for(uint i=t;i<p.b;i+=256)z+=exp(s[p.a+i]-top);float denom=sum256(z);if(t==0){diag[0]=uintBitsToFloat(dvocab[floatBitsToUint(buf[0])]);diag[1]=top;diag[2]=1/denom;}}else if(t==0){diag[0]=buf[0];diag[1]=red[0];}
+ }else if(p.op==26){if(idx<10240)s[p.a+idx]+=s[p.b+idx%2560];
+ }else if(p.op==27){if(idx<p.c)s[p.b+idx]=s[p.a+idx];
+ }else if(p.op==28){if(idx<min(ctl[0]+1,2051))s[p.a+idx]=uintBitsToFloat(max(int(ctl[0]+1)-2051,0)+int(idx));
+ }else if(p.op==23){ // concatenate native-q8_1-rounded input for quantized dense GEMV
+  float x=0;if(t<32&&row*32+t<p.c)x=s[p.a+row*32+t];buf[t]=abs(x);barrier();
+  for(uint k=128;k>0;k>>=1){if(t<k)buf[t]=max(buf[t],buf[t+k]);barrier();}
+  float d=buf[0]/127.0,q=d==0?0:clamp(sign(x)*floor(abs(x/d)+0.5),-127,127);float dh=unpackHalf2x16(packHalf2x16(vec2(d,0))).x;
+  if(t<32)s[p.b+row*32+t]=q*dh;
+ }
+}

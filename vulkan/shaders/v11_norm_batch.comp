@@ -1,0 +1,22 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "v11_common.glsl"
+layout(local_size_x=256) in;
+shared float red[256];shared float buf[256];
+float sum256(float x){
+ float sum=subgroupAdd(x);if(gl_SubgroupInvocationID==0)red[gl_SubgroupID]=sum;barrier();
+ return subgroupAdd(gl_SubgroupInvocationID<8?red[gl_SubgroupInvocationID]:0);
+}
+// Preserve the V10 reduction tree and arithmetic; only the frame offset changes.
+void main(){uint t=gl_LocalInvocationID.x,row=gl_WorkGroupID.x,frame=gl_WorkGroupID.y*p.l;
+ if(p.op==1||p.op==25){ // RMS or L2 normalization, one workgroup per row
+  uint base=p.a+row*p.d,outb=p.b+row*p.d;float z=0;
+  for(uint i=t;i<p.d;i+=256){float x=s[frame+base+i];if(p.op==25){x+=s[frame+p.h+i]*(2*sigmoid(s[frame+p.i+row]*0.25));s[frame+base+i]=x;}z+=x*x;}
+  float ss=sum256(z);float inv=inversesqrt((p.g==1?ss:ss/float(p.d))+1e-6);
+  for(uint i=t;i<p.d;i+=256){float gamma=p.f==0?1:uintBitsToFloat(w[p.c/4+(p.f==2?row*p.d:0)+i]);s[frame+outb+i]=s[frame+base+i]*inv*gamma;}
+ }else if(p.op==7){ // GDN output RMS norm, weight shared across heads, sigmoid gate
+  uint base=p.a+row*128;float z=0;for(uint i=t;i<128;i+=256){float x=s[frame+base+i];if(p.op==25){x+=s[frame+p.h+i]*(2*sigmoid(s[frame+p.i+row]*0.25));s[frame+base+i]=x;}z+=x*x;}
+  float inv=inversesqrt(sum256(z)/128+1e-6);if(t<128)s[frame+p.b+row*128+t]=s[frame+base+t]*inv*uintBitsToFloat(w[p.c/4+t])*sigmoid(s[frame+p.d+row*128+t]);
+ }
+}

@@ -1,0 +1,24 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "v11_common.glsl"
+layout(local_size_x=256) in;
+// Channel-local convolution is causal across the window. Preserve its exact
+// four-term arithmetic and save only rollback prefixes, without transfer passes.
+void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=10240)return;
+ uint state=p.c+idx*3;float a=st[state],b=st[state+1],c=st[state+2];
+ for(uint t=0;t<p.o;t++){uint frame=t*p.l;float x=s[frame+p.a+idx],v=0;
+  v+=a*uintBitsToFloat(w[p.d/4+idx*4]);
+  v+=b*uintBitsToFloat(w[p.d/4+idx*4+1]);
+  v+=c*uintBitsToFloat(w[p.d/4+idx*4+2]);
+  v+=x*uintBitsToFloat(w[p.d/4+idx*4+3]);
+  finite_value(v);
+  s[frame+p.b+idx]=silu(v);a=b;b=c;c=x;
+  if(t<4){uint save=t*p.i+p.j+state;snaps[save]=a;snaps[save+1]=b;snaps[save+2]=c;}
+  if(idx<48){float alpha=s[frame+p.e+idx]+uintBitsToFloat(w[p.g/4+idx]);
+   float sp=alpha>20?alpha:log(1+exp(alpha));
+   float decay=exp(sp*uintBitsToFloat(w[p.h/4+idx]));finite_value(decay);
+   s[frame+p.e+idx]=decay;
+   s[frame+p.f+idx]=sigmoid(s[frame+p.f+idx]);}
+ }
+ st[state]=a;st[state+1]=b;st[state+2]=c;
+}

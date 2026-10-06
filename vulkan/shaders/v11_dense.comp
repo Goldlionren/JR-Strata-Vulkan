@@ -1,0 +1,93 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_integer_dot_product : require
+#include "v11_common.glsl"
+layout(local_size_x=32) in;
+layout(constant_id=0) const uint TYPE=0;
+const uvec4 codebook_bytes=uvec4(0xbfad9881u,0xf6eaddcfu,0x26190d01u,0x71594535u);
+// Every 8 lanes own one output row. Specializing the native type removes all
+// unrelated format decoders from each persistent pipeline.
+vec2 scale_min(uint base,uint i){
+ if(TYPE==8)return vec2(f16(base+(i/32)*34),0);
+ if(TYPE>=100){uint off=base+(i/256)*(TYPE==100?212:140);return vec2(f16(off)*float(i8(off+2+(i%256)/(TYPE==100?16:32))),0);}
+ if(TYPE==42)return vec2(f16(base+(i/64)*18),0);
+ if(TYPE==20)return vec2(f16(base+(i/32)*18),0);
+ if(TYPE==21){uint off=base+(i/256)*110,ib=(i%256)/32;return vec2(f16(off)*float(1+2*((u8(off+106+ib/2)>>((ib%2)*4))&15)),0);}
+ if(TYPE==23){uint off=base+(i/256)*136,ib=(i%256)/32;int sc=int(((u8(off+4+ib/2)>>((ib%2)*4))&15)|(((u16(off+2)>>(2*ib))&3)<<4))-32;return vec2(f16(off)*float(sc),0);}
+ if(TYPE==14){uint off=base+(i/256)*210,j=i%256,halfb=j/128,z=j%128,l=z%32,grp=z/32;return vec2(f16(off+208)*float(i8(off+192+halfb*8+grp*2+l/16)),0);}
+ uint off=base+(i/256)*(TYPE==12?144:176),group=(i%256)/32,scale,mn;
+ if(group<4){scale=u8(off+4+group)&63;mn=u8(off+8+group)&63;}
+ else{scale=(u8(off+8+group)&15)|((u8(off+group)>>6)<<4);mn=(u8(off+8+group)>>4)|((u8(off+4+group)>>6)<<4);}
+ return vec2(f16(off)*float(scale),-f16(off+2)*float(mn));
+}
+int symbol(uint base,uint i){
+ if(TYPE==42){uint off=base+(i/64)*18;return int((u8(off+2+(i%64)/4)>>((i%4)*2))&3)-1;}
+ if(TYPE==20){uint off=base+(i/32)*18,j=i%32;return cb[(u8(off+2+j%16)>>((j/16)*4))&15];}
+ if(TYPE==23){uint off=base+(i/256)*136,j=i%256;return cb[(u8(off+8+(j/32)*16+j%16)>>(((j%32)/16)*4))&15];}
+ if(TYPE==21){uint off=base+(i/256)*110,j=i%256,ib=j/32,il=(j%32)/8,q=(j%8)/4;
+  uint gi=u8(off+2+ib*8+il*2+q)|(((u8(off+66+ib)>>(il*2+q))&1)<<8);int sym=int((grid[gi]>>((j%4)*8))&255);return ((u8(off+74+ib*4+il)>>(j%8))&1)!=0?-sym:sym;}
+ if(TYPE==14){uint off=base+(i/256)*210,j=i%256,halfb=j/128,z=j%128,l=z%32,grp=z/32;return int(((u8(off+halfb*64+(grp%2)*32+l)>>((grp/2)*4))&15)|(((u8(off+128+halfb*32+l)>>(2*grp))&3)<<4))-32;}
+ uint off=base+(i/256)*(TYPE==12?144:176),j=i%256,group=j/32;uint q=(u8(off+(TYPE==12?16:48)+(j/64)*32+j%32)>>(((j%64)/32)*4))&15;
+ if(TYPE==13)q|=((u8(off+16+j%32)>>group)&1)<<4;return int(q);
+}
+uint word32(uint off){uint lo=w[off/4],sh=(off%4)*8;if(sh==0)return lo;return (lo>>sh)|(w[off/4+1]<<(32-sh));}
+uint signed_q6(uint q){uint pack=(q&63)|(((q>>6)&63)<<8)|(((q>>12)&63)<<16)|(((q>>18)&63)<<24);return pack|(((pack&0x20202020u)>>5)*192u);}
+uint packed_codes(uint base,uint i){
+ if(TYPE==8)return word32(base+(i/32)*34+2+i%32);
+ if(TYPE==100){uint q=word32(base+(i/256)*212+20+(i%256)/4*3);uint pack=(q&63)|(((q>>6)&63)<<8)|(((q>>12)&63)<<16)|(((q>>18)&63)<<24);return pack|(((pack&0x20202020u)>>5)*192u);}
+ if(TYPE==103){uint codes=u16(base+(i/256)*140+12+(i%256)/2);return grid[512+(codes&255)]|(grid[512+(codes>>8)]<<16);}
+ if(TYPE==101){uint codes=u16(base+(i/256)*140+12+(i%256)/2);
+  uint bytes=(codes&15)|((codes&240)<<4)|((codes&3840)<<8)|((codes&61440)<<12);
+  uint magnitude=((bytes&0x07070707u)<<1)|0x01010101u,negative=(bytes&0x08080808u)>>3;
+  return (magnitude^(negative*255u))+negative;
+ }
+ if(TYPE==102){uint codes=u16(base+(i/256)*140+12+(i%256)/2),pack=0;
+  for(uint j=0;j<4;j++){uint c=(codes>>(4*j))&15;pack|=((codebook_bytes[c>>2]>>((c&3)*8))&255)<<(j*8);}return pack;}
+ if(TYPE==20){uint off=base+(i/32)*18,j=i%32;uint q=(word32(off+2+j%16)>>((j/16)*4))&0x0f0f0f0fu;
+  uint first=(q&15)|((q>>4)&240),second=((q>>16)&15)|((q>>20)&240);
+  return grid[512+first]|(grid[512+second]<<16);
+ }
+
+ if(TYPE==14){uint off=base+(i/256)*210,j=i%256,halfb=j/128,z=j%128,l=z%32,grp=z/32;
+  uint lo=word32(off+halfb*64+(grp%2)*32+l),hi=word32(off+128+halfb*32+l);
+  uint q=((lo>>((grp/2)*4))&0x0f0f0f0fu)|(((hi>>(2*grp))&0x03030303u)<<4);
+  return (q&0x1f1f1f1fu)|(((~q&0x20202020u)>>5)*224u);
+ }
+ if(TYPE==12||TYPE==13){uint off=base+(i/256)*(TYPE==12?144:176),j=i%256,group=j/32;
+  uint q=(word32(off+(TYPE==12?16:48)+(j/64)*32+j%32)>>(((j%64)/32)*4))&0x0f0f0f0fu;
+  if(TYPE==13)q|=((word32(off+16+j%32)>>group)&0x01010101u)<<4;return q;
+ }
+ if(TYPE==21){uint off=base+(i/256)*110,j=i%256,ib=j/32,il=(j%32)/8,part=(j%8)/4;
+  uint gi=u8(off+2+ib*8+il*2+part)|(((u8(off+66+ib)>>(il*2+part))&1)<<8),vals=grid[gi],signs=u8(off+74+ib*4+il)>>(part*4);uint result=0;
+  for(uint k=0;k<4;k++){int v=int((vals>>(k*8))&255);if(((signs>>k)&1)!=0)v=-v;result|=(uint(v)&255)<<(k*8);}return result;
+ }
+ uint result=0;for(uint k=0;k<4;k++)result|=(uint(symbol(base,i+k))&255)<<(k*8);return result;
+}
+void main(){uint lane=gl_LocalInvocationID.x,sub=lane&7,row=gl_WorkGroupID.x*4+lane/8;float sum=0;
+ if(row<p.e){uint base=p.a+(p.m!=0?dvocab[row]:row)*p.g;
+ if(TYPE==0){for(uint i=sub*2;i<p.d;i+=16)sum+=uintBitsToFloat(w[base/4+i])*s[p.b+i]+uintBitsToFloat(w[base/4+i+1])*s[p.b+i+1];}
+ else if(TYPE==30||TYPE==1){for(uint i=sub*2;i<p.d;i+=16){uint packed=w[base/4+i/2];vec2 weight=TYPE==30?vec2(uintBitsToFloat(packed<<16),uintBitsToFloat(packed&0xffff0000u)):unpackHalf2x16(packed);sum+=weight.x*s[p.b+i]+weight.y*s[p.b+i+1];}}
+ else{for(uint b=sub;b<p.d/32;b+=8){float dx=unpackHalf2x16(floatBitsToUint(s[p.b+b*9])).x;
+  vec2 sc=scale_min(base,b*32);int dot0=0,dot1=0;
+  if(TYPE==100){uint at=(base+(b/8)*212+20)/4+(b%8)*6;
+   uint w0=w[at],w1=w[at+1],w2=w[at+2];
+   dot0=dotPacked4x8EXT(int(signed_q6(w0)),int(floatBitsToUint(s[p.b+b*9+1])))
+       +dotPacked4x8EXT(int(signed_q6((w0>>24)|(w1<<8))),int(floatBitsToUint(s[p.b+b*9+2])))
+       +dotPacked4x8EXT(int(signed_q6((w1>>16)|(w2<<16))),int(floatBitsToUint(s[p.b+b*9+3])))
+       +dotPacked4x8EXT(int(signed_q6(w2>>8)),int(floatBitsToUint(s[p.b+b*9+4])));
+   w0=w[at+3];w1=w[at+4];w2=w[at+5];
+   dot1=dotPacked4x8EXT(int(signed_q6(w0)),int(floatBitsToUint(s[p.b+b*9+5])))
+       +dotPacked4x8EXT(int(signed_q6((w0>>24)|(w1<<8))),int(floatBitsToUint(s[p.b+b*9+6])))
+       +dotPacked4x8EXT(int(signed_q6((w1>>16)|(w2<<16))),int(floatBitsToUint(s[p.b+b*9+7])))
+       +dotPacked4x8EXT(int(signed_q6(w2>>8)),int(floatBitsToUint(s[p.b+b*9+8])));
+  }else{
+   for(uint j=0;j<16;j+=4){uint x=floatBitsToUint(s[p.b+b*9+1+j/4]);dot0+=dotPacked4x8EXT(int(packed_codes(base,b*32+j)),int(x));}
+   for(uint j=16;j<32;j+=4){uint x=floatBitsToUint(s[p.b+b*9+1+j/4]);dot1+=dotPacked4x8EXT(int(packed_codes(base,b*32+j)),int(x));}
+  }
+  vec2 sc1=(TYPE==14||TYPE==100)?scale_min(base,b*32+16):sc;sum+=dx*(sc.x*float(dot0)+sc1.x*float(dot1));
+  if(TYPE==12||TYPE==13)sum+=sc.y*unpackHalf2x16(floatBitsToUint(s[p.b+b*9])).y;
+ }} }
+ sum+=subgroupShuffleXor(sum,4);sum+=subgroupShuffleXor(sum,2);sum+=subgroupShuffleXor(sum,1);
+ if(sub==0&&row<p.e){s[p.c+row]=sum;finite_value(sum);}
+}

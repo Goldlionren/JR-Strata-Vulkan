@@ -1,0 +1,17 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "v11_common.glsl"
+layout(local_size_x=256) in;
+// One subgroup ranks one pooled block; integer ranks and tie ordering are exact.
+void main(){uint frame=gl_WorkGroupID.y,offset=frame*p.l,nk=ctl[frame*p.k]+1;
+ if(nk<=2051){uint idx=gl_GlobalInvocationID.x;if(idx<nk)s[offset+p.c+idx]=uintBitsToFloat(idx);return;}
+ uint nb=nk/4,tail=nk%4,idx=gl_WorkGroupID.x*8+gl_SubgroupID,lane=gl_SubgroupInvocationID;
+ if(idx>nb||(idx==nb&&tail==0))return;
+ float score=s[offset+p.a+idx];uint rank=0;
+ for(uint b=lane;b<=nb;b+=32){uint count=b==nb?tail:4;if(count==0)continue;
+  float z=s[offset+p.a+b];if(z>score||(z==score&&b<idx))rank+=count;
+ }
+ rank=subgroupAdd(rank);
+ if(lane==0){uint count=idx==nb?tail:4;for(uint j=0;j<count;j++)if(rank+j<2051)s[offset+p.c+rank+j]=uintBitsToFloat(idx*4+j);}
+}

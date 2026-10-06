@@ -1,0 +1,11 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#include "v11_common.glsl"
+layout(local_size_x=128) in;
+layout(constant_id=0) const uint COLUMNS=5;
+void main(){uint lane=gl_SubgroupInvocationID,stream=lane/8,sub=lane&7,d=gl_WorkGroupID.x*4+gl_SubgroupID,base=p.a+(stream*2560+d)*640;float sums[COLUMNS];[[unroll]] for(uint t=0;t<COLUMNS;t++)sums[t]=0;
+ for(uint i=sub*2;i<320;i+=16){uint packed=w[base/4+i/2];vec2 weight=vec2(uintBitsToFloat(packed<<16),uintBitsToFloat(packed&0xffff0000u));[[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<p.o)sums[t]+=weight.x*s[t*p.l+p.b+i]+weight.y*s[t*p.l+p.b+i+1];}
+ [[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<p.o){float sum=sums[t];sum+=subgroupShuffleXor(sum,4);sum+=subgroupShuffleXor(sum,2);sum+=subgroupShuffleXor(sum,1);float value=s[t*p.l+p.d+stream*2560+d]*sigmoid(sum);float mixed=((subgroupShuffle(value,0)+subgroupShuffle(value,8))+subgroupShuffle(value,16))+subgroupShuffle(value,24);if(lane==0)s[t*p.l+p.c+d]=mixed*0.25;}
+}

@@ -1,0 +1,25 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "v11_common.glsl"
+layout(local_size_x=512) in;
+shared float maxima[16], sums[16], probs[10], best, origin, denominator;
+shared uint winners[16], chosen[10], winner;
+void maximum_id(float value,uint id){
+ float mx=subgroupMax(value);uint ix=subgroupMin(value==mx?id:0xffffffffu);
+ if(gl_SubgroupInvocationID==0){maxima[gl_SubgroupID]=mx;winners[gl_SubgroupID]=ix;}
+ barrier();
+ if(gl_SubgroupID==0){uint t=gl_SubgroupInvocationID;float m=subgroupMax(t<16?maxima[t]:-3.402823e38);uint widx=subgroupMin(t<16&&maxima[t]==m?winners[t]:0xffffffffu);
+  if(t==0){best=m;winner=widx;}}
+ barrier();
+}
+void main(){uint t=gl_LocalInvocationID.x;float value=s[p.a+t];maximum_id(value,t);
+ if(t==0)origin=best;barrier();float sum=subgroupAdd(exp(value-origin));
+ if(gl_SubgroupInvocationID==0)sums[gl_SubgroupID]=sum;barrier();
+ if(gl_SubgroupID==0){float denom=subgroupAdd(gl_SubgroupInvocationID<16?sums[gl_SubgroupInvocationID]:0);if(gl_SubgroupInvocationID==0)denominator=denom;}
+ barrier();
+ for(uint r=0;r<10;r++){if(r!=0)maximum_id(value,t);if(t==0){chosen[r]=winner;probs[r]=exp(best-origin)/denominator;}barrier();if(t==winner)value=-3.402823e38;}
+ float selected=0;for(uint r=0;r<10;r++)selected+=probs[r];
+ if(t<10){rw[t]=probs[t]/selected;diag[p.b+t]=uintBitsToFloat(chosen[t]);}
+ if(t<80)meta[t]=plan[chosen[t/8]*8+t%8];
+}
