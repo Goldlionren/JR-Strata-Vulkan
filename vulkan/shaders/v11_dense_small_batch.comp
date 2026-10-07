@@ -7,10 +7,10 @@ layout(local_size_x=256) in;
 layout(constant_id=0) const uint FORMAT=1280;
 const uint TYPE=FORMAT&255, COLUMNS=FORMAT>>8;
 shared float sums[8*COLUMNS];
-// Preserve V10's reduction and accumulation order for the small dense path.
+// Window rows are fixed by the pipeline specialization. Preserve V10's reduction and accumulation order for the small dense path.
 void main(){uint lane=gl_LocalInvocationID.x,row=gl_WorkGroupID.x,base=(p.op==1&&row>=320)?p.i+(row-320)*p.g:p.a+row*p.g;float acc[COLUMNS];for(uint t=0;t<COLUMNS;t++)acc[t]=0;
- if(TYPE==30||TYPE==1){for(uint i=lane*2;i<p.d;i+=512){uint packed=w[base/4+i/2];vec2 weight=TYPE==30?vec2(uintBitsToFloat(packed<<16),uintBitsToFloat(packed&0xffff0000u)):unpackHalf2x16(packed);[[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<p.o)acc[t]+=weight.x*s[t*p.l+p.b+i]+weight.y*s[t*p.l+p.b+i+1];}}
- else{for(uint i=lane;i<p.d;i+=256){float weight=uintBitsToFloat(w[base/4+i]);[[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<p.o)acc[t]+=weight*s[t*p.l+p.b+i];}}
- for(uint t=0;t<p.o;t++){float sum=subgroupAdd(acc[t]);if(gl_SubgroupInvocationID==0)sums[t*8+gl_SubgroupID]=sum;}barrier();
- if(gl_SubgroupID==0)for(uint t=0;t<p.o;t++){float sum=subgroupAdd(lane<8?sums[t*8+lane]:0);if(lane==0){if(p.op==1&&row>=320)s[t*p.l+p.j+row-320]=sum;else s[t*p.l+p.c+row]=p.op==1?silu(sum*0.25):sum;finite_value(sum);}}
+ if(TYPE==30||TYPE==1){for(uint i=lane*2;i<p.d;i+=512){uint packed=w[base/4+i/2];vec2 weight=TYPE==30?vec2(uintBitsToFloat(packed<<16),uintBitsToFloat(packed&0xffff0000u)):unpackHalf2x16(packed);[[unroll]] for(uint t=0;t<COLUMNS;t++)acc[t]+=weight.x*s[t*p.l+p.b+i]+weight.y*s[t*p.l+p.b+i+1];}}
+ else{for(uint i=lane;i<p.d;i+=256){float weight=uintBitsToFloat(w[base/4+i]);[[unroll]] for(uint t=0;t<COLUMNS;t++)acc[t]+=weight*s[t*p.l+p.b+i];}}
+ for(uint t=0;t<COLUMNS;t++){float sum=subgroupAdd(acc[t]);if(gl_SubgroupInvocationID==0)sums[t*8+gl_SubgroupID]=sum;}barrier();
+ if(gl_SubgroupID==0)for(uint t=0;t<COLUMNS;t++){float sum=subgroupAdd(lane<8?sums[t*8+lane]:0);if(lane==0){if(p.op==1&&row>=320)s[t*p.l+p.j+row-320]=sum;else s[t*p.l+p.c+row]=p.op==1?silu(sum*0.25):sum;finite_value(sum);}}
 }

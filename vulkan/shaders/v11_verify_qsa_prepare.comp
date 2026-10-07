@@ -1,0 +1,21 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "v11_common.glsl"
+layout(local_size_x=256) in;
+shared float red[8];shared float normalized[256];
+// op 0: query split + RMS + rotary; op 1: key RMS + rotary + FP16 KV;
+// op 2: indexer-query RMS + rotary. Preserve the reference 256-lane tree.
+void main(){uint d=gl_LocalInvocationID.x,head=gl_WorkGroupID.x,frame=gl_WorkGroupID.y*p.l;
+ uint base=p.a+head*(p.op==0?512:p.d);float x=d<p.d?s[frame+base+d]:0,z=0;if(d<p.d)z+=x*x;
+ float ss=subgroupAdd(z);if(gl_SubgroupInvocationID==0)red[gl_SubgroupID]=ss;barrier();
+ ss=subgroupAdd(gl_SubgroupInvocationID<8?red[gl_SubgroupInvocationID]:0);
+ float inv=inversesqrt(ss/float(p.d)+1e-6);
+ if(d<p.d)normalized[d]=x*inv*uintBitsToFloat(w[p.c/4+d]);barrier();
+ if(d<32){float ang=float(ctl[gl_WorkGroupID.y*p.k])*pow(1e7,-float(2*d)/64),co=cos(ang),si=sin(ang);
+  float a=normalized[d],b=normalized[d+32];normalized[d]=a*co-b*si;normalized[d+32]=a*si+b*co;}
+ barrier();if(d<p.d)s[frame+p.b+head*p.d+d]=normalized[d];
+ if(p.op==1&&d<128){uint at=ctl[gl_WorkGroupID.y*p.k]*256+head*128+d;
+  kv[at]=packHalf2x16(vec2(normalized[d*2],normalized[d*2+1]));
+  kv[p.f*256+at]=packHalf2x16(vec2(s[frame+p.e+head*256+d*2],s[frame+p.e+head*256+d*2+1]));}
+}

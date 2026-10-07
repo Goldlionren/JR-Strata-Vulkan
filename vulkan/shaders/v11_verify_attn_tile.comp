@@ -1,0 +1,32 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "v11_common.glsl"
+layout(local_size_x=384) in;
+// One KV head and one 32-cell split. Decode KV once for its twelve query heads.
+// Keep the exact register accumulation, subgroup reduction and softmax ordering.
+shared uint keys[4096];
+shared uint values[4096];
+void main(){uint frame=gl_WorkGroupID.z,offset=frame*p.l,control=frame*p.k;
+ uint kh=gl_WorkGroupID.x/1,head_group=gl_WorkGroupID.x%1,split=gl_WorkGroupID.y,count=min(ctl[control]+1,2051),begin=split*32;
+ if(begin>=count)return;uint cells=min(32,count-begin);
+ for(uint i=gl_LocalInvocationID.x;i<cells*128;i+=384){uint cell=i/128,d=i%128;
+  uint id=floatBitsToUint(s[offset+p.c+begin+cell]);
+  keys[i]=kv[p.d+id*256+kh*128+d];
+  values[i]=kv[p.d+p.e*256+id*256+kh*128+d];
+ }
+ barrier();uint lane=gl_SubgroupInvocationID,h=kh*12+head_group*12+gl_SubgroupID;float query[8],acc[8];
+ for(uint k=0;k<8;k++){query[k]=s[offset+p.a+h*256+lane+k*32];acc[k]=0;}
+ float ownscore=-3.402823e38;
+ for(uint t=0;t<cells;t++){float z=0;for(uint k=0;k<8;k++)z+=query[k]*unpackHalf2x16(keys[t*128+(lane>>1)+k*16])[lane&1];
+  float score=subgroupAdd(z)/16;if(lane==t)ownscore=score;
+ }
+ float maximum=subgroupMax(ownscore),weight=exp(ownscore-maximum),sum=subgroupAdd(weight);
+ for(uint t=0;t<cells;t++){float wt=subgroupShuffle(weight,t);
+  for(uint k=0;k<8;k++)acc[k]+=wt*unpackHalf2x16(values[t*128+(lane>>1)+k*16])[lane&1];
+ }
+ uint base=offset+p.b+(h*65+split)*258;
+ for(uint k=0;k<8;k++)s[base+lane+k*32]=acc[k];
+ if(lane==0){s[base+256]=maximum;s[base+257]=sum;}
+}

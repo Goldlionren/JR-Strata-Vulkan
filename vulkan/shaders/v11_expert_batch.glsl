@@ -1,4 +1,8 @@
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+// Wider verification pipelines keep each original eight-lane output row.
+#ifndef JR_GROUP_WIDTH
+#define JR_GROUP_WIDTH 32
+#endif
+layout(local_size_x = JR_GROUP_WIDTH, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer RamWeights {
     uint ram_words[];
@@ -50,8 +54,10 @@ layout(push_constant) uniform Push {
 } pc;
 
 layout(set=0,binding=12,std430) readonly buffer GroupSlots {uint slots[];};
-layout(constant_id=0) const uint COLUMNS=5;
-shared float reduce_buf[32*COLUMNS];
+layout(constant_id=0) const uint FORMAT=5;
+const uint COLUMNS=FORMAT&255, POSITIONS=(FORMAT>>8)&255;
+bool valid_position(uint t){return POSITIONS==0?t<pc.rows:t<POSITIONS;}
+shared float reduce_buf[JR_GROUP_WIDTH*COLUMNS];
 
 uint m(uint rank, uint field) {
     return meta[rank * 8u + field];
@@ -78,7 +84,7 @@ uint load_u32_fast(uint tier, uint off) {
 }
 
 uint load_u16_fast(uint tier, uint off) {
-    return load_u32_fast(tier, off) & 0xffffu;
+    return (tier_word(tier, off >> 2u) >> ((off & 2u) * 8u)) & 0xffffu;
 }
 
 float load_f16(uint tier, uint off) {
@@ -150,23 +156,21 @@ uint iq4_word_raw(uint raw, bool high) {
 }
 
 uint q2_codes4(uint packed) {
-    int a = int((packed >> 0u) & 3u) - 1;
-    int b = int((packed >> 2u) & 3u) - 1;
-    int c = int((packed >> 4u) & 3u) - 1;
-    int d = int((packed >> 6u) & 3u) - 1;
-    return pack_s8_4(a, b, c, d);
+    uint bytes = (packed & 3u) | ((packed & 12u) << 6u) |
+                 ((packed & 48u) << 12u) | ((packed & 192u) << 18u);
+    return ((bytes | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
 }
 
 uint bases[COLUMNS];uint destinations[COLUMNS];float accum[COLUMNS], input_scales[COLUMNS];
-void input_scale(uint vi){[[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<pc.rows&&destinations[t]!=0xffffffffu)input_scales[t]=q8_scale(bases[t],vi);}
+void input_scale(uint vi){[[unroll]] for(uint t=0;t<COLUMNS;t++)if(valid_position(t)&&destinations[t]!=0xffffffffu)input_scales[t]=q8_scale(bases[t],vi);}
 void add_part(float dw,uvec2 codes,uint vi){
- [[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<pc.rows&&destinations[t]!=0xffffffffu){int dotv=dp4a_hw(codes.x,q8_word4(bases[t],vi))+dp4a_hw(codes.y,q8_word4(bases[t],vi+4));accum[t]+=(dw*input_scales[t])*float(dotv);}
+ [[unroll]] for(uint t=0;t<COLUMNS;t++)if(valid_position(t)&&destinations[t]!=0xffffffffu){int dotv=dp4a_hw(codes.x,q8_word4(bases[t],vi))+dp4a_hw(codes.y,q8_word4(bases[t],vi+4));accum[t]+=(dw*input_scales[t])*float(dotv);}
 }
 
-void main(){uint lane=gl_LocalInvocationID.x,sub=lane&7,row_lane=lane/8,rank=gl_WorkGroupID.y,row_global=gl_WorkGroupID.x*4+row_lane;
+void main(){uint lane=gl_LocalInvocationID.x,sub=lane&7,row_lane=lane/8,rank=gl_WorkGroupID.y,row_global=gl_WorkGroupID.x*(JR_GROUP_WIDTH/8)+row_lane;
  bool valid=row_global<(pc.role==0?2*pc.n_ff:pc.n_embd);uint tier=m(rank,0),row=row_global;bool up=pc.role==0&&row>=pc.n_ff;if(up)row-=pc.n_ff;
  uint base=pc.role==0?(up?m(rank,4):m(rank,3)):m(rank,5),rowbytes=pc.role==0?m(rank,6):m(rank,7),cols=pc.role==0?pc.n_embd:pc.n_ff,row0=base+row*rowbytes;
- [[unroll]] for(uint t=0;t<COLUMNS;t++){uint slot=slots[rank*5+t];destinations[t]=slot;bases[t]=pc.role==0?t*pc.input_stride:t*pc.input_stride+(slot%10)*(pc.n_ff/32)*9;accum[t]=0;}
+ [[unroll]] for(uint t=0;t<COLUMNS;t++){uint slot=valid_position(t)?slots[rank*5+t]:0xffffffffu;destinations[t]=slot;bases[t]=pc.role==0?t*pc.input_stride:t*pc.input_stride+(slot%10)*(pc.n_ff/32)*9;accum[t]=0;}
  if(valid){
 #if JR_TYPE==16 || JR_TYPE==17 || JR_TYPE==18 || JR_TYPE==21 || JR_TYPE==22
  for(uint b=0;b<cols/256;b++){
@@ -214,7 +218,7 @@ void main(){uint lane=gl_LocalInvocationID.x,sub=lane&7,row_lane=lane/8,rank=gl_
  }}
 #endif
  }
- [[unroll]] for(uint t=0;t<COLUMNS;t++)reduce_buf[t*32+lane]=accum[t];barrier();
- for(uint step=4;step>0;step>>=1){if(sub<step)[[unroll]] for(uint t=0;t<COLUMNS;t++)reduce_buf[t*32+row_lane*8+sub]+=reduce_buf[t*32+row_lane*8+sub+step];barrier();}
- if(valid&&sub==0)[[unroll]] for(uint t=0;t<COLUMNS;t++)if(destinations[t]!=0xffffffffu){uint slot=destinations[t]%10,out_index=t*pc.output_stride+(pc.role==0?slot*2*pc.n_ff+row_global:slot*pc.n_embd+row);y[out_index]=reduce_buf[t*32+row_lane*8];}
+ [[unroll]] for(uint t=0;t<COLUMNS;t++)reduce_buf[t*JR_GROUP_WIDTH+lane]=accum[t];barrier();
+ for(uint step=4;step>0;step>>=1){if(sub<step)[[unroll]] for(uint t=0;t<COLUMNS;t++)reduce_buf[t*JR_GROUP_WIDTH+row_lane*8+sub]+=reduce_buf[t*JR_GROUP_WIDTH+row_lane*8+sub+step];barrier();}
+ if(valid&&sub==0)[[unroll]] for(uint t=0;t<COLUMNS;t++)if(destinations[t]!=0xffffffffu){uint slot=destinations[t]%10,out_index=t*pc.output_stride+(pc.role==0?slot*2*pc.n_ff+row_global:slot*pc.n_embd+row);y[out_index]=reduce_buf[t*JR_GROUP_WIDTH+row_lane*8];}
 }

@@ -1,0 +1,27 @@
+#version 460
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Routes {uint routes[];};
+layout(set=0,binding=1,std430) buffer Groups {uint groups[];};
+layout(set=0,binding=2,std430) buffer Slots {uint slots[];};
+layout(set=0,binding=3,std430) buffer StageMeta {uint staged_meta[];};
+layout(push_constant) uniform Push {uint rows,stride,gu_x,down_x;} p;
+shared uint leaders[64];shared uint tiers[64];
+// Preserve native group order and slots. Spare control words carry only the
+// host-expert list and copy dispatch; residency flags remain unchanged.
+void main(){uint i=gl_LocalInvocationID.x,total=p.rows*10,at=(i/10)*p.stride+(i%10)*8;bool leader=i<total;
+ if(leader)for(uint j=0;j<i;j++){uint previous=(j/10)*p.stride+(j%10)*8;
+  if(routes[previous]==routes[at]&&routes[previous+3]==routes[at+3]){leader=false;break;}}
+ leaders[i]=leader?1:0;barrier();uint group=0;for(uint j=0;j<i;j++)group+=leaders[j];
+ if(leader){
+  tiers[group]=routes[at];for(uint f=0;f<8;f++){uint v=routes[at+f];groups[group*8+f]=v;staged_meta[group*8+f]=v;}
+  for(uint t=0;t<5;t++){uint slot=0xffffffffu;if(t<p.rows)for(uint r=0;r<10;r++){
+   uint x=t*p.stride+r*8;if(routes[x]==routes[at]&&routes[x+3]==routes[at+3]){slot=t*10+r;break;}}
+   slots[group*5+t]=slot;}
+ }
+ barrier();
+ if(i==0){uint count=0,host_count=0;for(uint j=0;j<64;j++)count+=leaders[j];
+  for(uint rank=0;rank<count;rank++)if(tiers[rank]==0)slots[250+host_count++]=rank;
+  slots[508]=32;slots[509]=host_count;slots[510]=3;
+  slots[512]=p.gu_x;slots[513]=count;slots[514]=1;slots[516]=p.down_x;slots[517]=count;slots[518]=1;
+ }
+}

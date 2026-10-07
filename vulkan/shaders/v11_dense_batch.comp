@@ -4,7 +4,7 @@
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
 #include "v11_common.glsl"
-layout(local_size_x=32) in;
+layout(local_size_x=128) in;
 layout(constant_id=0) const uint FORMAT=1280;
 const uint TYPE=FORMAT&255, COLUMNS=FORMAT>>8;
 const uvec4 codebook_bytes=uvec4(0xbfad9881u,0xf6eaddcfu,0x26190d01u,0x71594535u);
@@ -66,13 +66,13 @@ uint packed_codes(uint base,uint i){
  }
  uint result=0;for(uint k=0;k<4;k++)result|=(uint(symbol(base,i+k))&255)<<(k*8);return result;
 }
-void main(){uint lane=gl_LocalInvocationID.x,sub=lane&7,row=gl_WorkGroupID.x*4+lane/8;float sums[COLUMNS];for(uint t=0;t<COLUMNS;t++)sums[t]=0;
+void main(){uint lane=gl_LocalInvocationID.x,sub=lane&7,row=gl_WorkGroupID.x*16+lane/8;float sums[COLUMNS];for(uint t=0;t<COLUMNS;t++)sums[t]=0;
  if(row<p.e){uint base=p.a+row*p.g;
- if(TYPE==0||TYPE==30||TYPE==1){for(uint i=sub*2;i<p.d;i+=16){vec2 weight;if(TYPE==0)weight=vec2(uintBitsToFloat(w[base/4+i]),uintBitsToFloat(w[base/4+i+1]));else{uint packed=w[base/4+i/2];weight=TYPE==30?vec2(uintBitsToFloat(packed<<16),uintBitsToFloat(packed&0xffff0000u)):unpackHalf2x16(packed);}[[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<p.o)sums[t]+=weight.x*s[t*p.l+p.b+i]+weight.y*s[t*p.l+p.b+i+1];}}
+ if(TYPE==0||TYPE==30||TYPE==1){for(uint i=sub*2;i<p.d;i+=16){vec2 weight;if(TYPE==0)weight=vec2(uintBitsToFloat(w[base/4+i]),uintBitsToFloat(w[base/4+i+1]));else{uint packed=w[base/4+i/2];weight=TYPE==30?vec2(uintBitsToFloat(packed<<16),uintBitsToFloat(packed&0xffff0000u)):unpackHalf2x16(packed);}[[unroll]] for(uint t=0;t<COLUMNS;t++)sums[t]+=weight.x*s[t*p.l+p.b+i]+weight.y*s[t*p.l+p.b+i+1];}}
  else{for(uint b=sub;b<p.d/32;b+=8){vec2 sc=scale_min(base,b*32),sc1=(TYPE==14||TYPE==100)?scale_min(base,b*32+16):sc;uint codes[8];
   if(TYPE==100){uint at=(base+(b/8)*212+20)/4+(b%8)*6;uint w0=w[at],w1=w[at+1],w2=w[at+2];codes[0]=signed_q6(w0);codes[1]=signed_q6((w0>>24)|(w1<<8));codes[2]=signed_q6((w1>>16)|(w2<<16));codes[3]=signed_q6(w2>>8);w0=w[at+3];w1=w[at+4];w2=w[at+5];codes[4]=signed_q6(w0);codes[5]=signed_q6((w0>>24)|(w1<<8));codes[6]=signed_q6((w1>>16)|(w2<<16));codes[7]=signed_q6(w2>>8);}
   else{[[unroll]] for(uint j=0;j<8;j++)codes[j]=packed_codes(base,b*32+j*4);}
-  [[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<p.o){uint qin=t*p.l+p.b+b*9;float dx=unpackHalf2x16(floatBitsToUint(s[qin])).x;int dot0=0,dot1=0;for(uint j=0;j<4;j++)dot0+=dotPacked4x8EXT(int(codes[j]),int(floatBitsToUint(s[qin+1+j])));for(uint j=4;j<8;j++)dot1+=dotPacked4x8EXT(int(codes[j]),int(floatBitsToUint(s[qin+1+j])));sums[t]+=dx*(sc.x*float(dot0)+sc1.x*float(dot1));if(TYPE==12||TYPE==13)sums[t]+=sc.y*unpackHalf2x16(floatBitsToUint(s[qin])).y;}
+  [[unroll]] for(uint t=0;t<COLUMNS;t++){uint qin=t*p.l+p.b+b*9;float dx=unpackHalf2x16(floatBitsToUint(s[qin])).x;int dot0=0,dot1=0;for(uint j=0;j<4;j++)dot0+=dotPacked4x8EXT(int(codes[j]),int(floatBitsToUint(s[qin+1+j])));for(uint j=4;j<8;j++)dot1+=dotPacked4x8EXT(int(codes[j]),int(floatBitsToUint(s[qin+1+j])));sums[t]+=dx*(sc.x*float(dot0)+sc1.x*float(dot1));if(TYPE==12||TYPE==13)sums[t]+=sc.y*unpackHalf2x16(floatBitsToUint(s[qin])).y;}
  }} }
- [[unroll]] for(uint t=0;t<COLUMNS;t++)if(t<p.o){float sum=sums[t];sum+=subgroupShuffleXor(sum,4);sum+=subgroupShuffleXor(sum,2);sum+=subgroupShuffleXor(sum,1);if(sub==0&&row<p.e){s[t*p.l+p.c+row]=sum;finite_value(sum);}}
+ [[unroll]] for(uint t=0;t<COLUMNS;t++){float sum=sums[t];sum+=subgroupShuffleXor(sum,4);sum+=subgroupShuffleXor(sum,2);sum+=subgroupShuffleXor(sum,1);if(sub==0&&row<p.e){s[t*p.l+p.c+row]=sum;finite_value(sum);}}
 }

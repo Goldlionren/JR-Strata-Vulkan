@@ -10,9 +10,10 @@ struct Push {
 };
 int main(int argc, char **argv) {
   try {
-    if (argc != 4)
+    if (argc < 4 || argc > 7)
       throw std::runtime_error("usage: attention-check captured-draft.f32 "
-                               "kv.bin query-float-offset");
+                               "kv.bin query-float-offset [tile.spv] "
+                               "[heads-per-group] [current-reference]");
     auto selector = jr::vk::selector_from_env();
     if (selector.vendor_id != 0x8086 || selector.device_id != 0xe211)
       throw std::runtime_error("only JR_VK_DEVICE=8086:e211");
@@ -65,8 +66,17 @@ int main(int argc, char **argv) {
     d[1] = info(scratch);
     d[2] = info(control);
     d[4] = info(kv);
-    auto reference = make_pipeline(ctx, JR_ATTN_REFERENCE, d, sizeof(Push)),
-         tile = make_pipeline(ctx, JR_ATTN_TILE, d, sizeof(Push));
+    bool current_reference =
+        argc == 7 && std::string(argv[6]) == "current-reference";
+    uint32_t heads = argc >= 6 ? std::stoul(argv[5]) : 12;
+    if (!heads || 12 % heads)
+      throw std::runtime_error("invalid head group");
+    auto reference = make_pipeline(
+             ctx, current_reference ? JR_ATTN_TILE : JR_ATTN_REFERENCE, d,
+             sizeof(Push)),
+         combine_pipe = make_pipeline(ctx, JR_ATTN_REFERENCE, d, sizeof(Push)),
+         tile = make_pipeline(ctx, argc >= 5 ? argv[4] : JR_ATTN_TILE, d,
+                              sizeof(Push));
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.queueFamilyIndex = ctx.queue_family();
     VkCommandPool pool;
@@ -129,16 +139,24 @@ int main(int argc, char **argv) {
         p.k = 16;
         uint32_t splits = (std::min(count, 2051u) + 31) / 32;
         for (uint32_t variant = 0; variant < 2; variant++) {
+          cp = {0, 0, input.size};
+          vkCmdCopyBuffer(cmd, input.buffer, scratch.buffer, 1, &cp);
+          barrier();
+          vkCmdFillBuffer(cmd, scratch.buffer, PART * 4, 24 * 65 * 258 * 4,
+                          0x7fc00001u);
+          barrier();
           vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               queries, variant * 2);
           for (uint32_t repeat = 0; repeat < 30; repeat++)
-            run(variant ? tile : reference, p, variant ? 2 : 3, splits, rows);
+            run(variant ? tile : reference, p,
+                variant ? 24 / heads : (current_reference ? 2 : 3), splits,
+                rows);
           vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               queries, variant * 2 + 1);
           Push combine{1, PART, OUT};
           combine.l = STRIDE;
           combine.k = 16;
-          run(reference, combine, 24, rows);
+          run(combine_pipe, combine, 24, rows);
           cp = {0, variant * scratch.size, scratch.size};
           vkCmdCopyBuffer(cmd, scratch.buffer, readback.buffer, 1, &cp);
           barrier();

@@ -1,0 +1,17 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#include "v11_common.glsl"
+layout(local_size_x=128) in;
+shared float scores[4];
+// Each subgroup keeps the RC's four independent 32-coordinate partials,
+// including the final zero-padded subgroup reduction. Heads run together.
+void main(){uint frame=gl_WorkGroupID.y,row=gl_WorkGroupID.x,offset=frame*p.l;
+ uint count=ctl[frame*p.k]+1,nb=count/4;if(count<=2051||row>nb)return;
+ uint lane=gl_SubgroupInvocationID,head=gl_SubgroupID,base=row==nb?p.c:p.b+row*128;
+ float parts[4];for(uint k=0;k<4;k++){float dotv=0;
+  dotv+=s[offset+p.a+head*128+lane+k*32]*st[base+lane+k*32];parts[k]=subgroupAdd(dotv);}
+ float sum=subgroupAdd(lane<4?parts[lane]:0);
+ if(lane==0)scores[head]=max(sum,0);
+ barrier();if(gl_LocalInvocationID.x==0){float score=0;for(uint h=0;h<4;h++)score+=scores[h];s[offset+p.d+row]=score;}
+}

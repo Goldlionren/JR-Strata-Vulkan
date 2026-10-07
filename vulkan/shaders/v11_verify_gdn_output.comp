@@ -1,0 +1,25 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "v11_common.glsl"
+layout(local_size_x=256) in;
+shared float red[8];
+// The exact reference RMS tree and output arithmetic, followed by its Q8_1
+// consumer in the same workgroup. Existing FP32 and Q8 buffers are preserved.
+void main(){uint d=gl_LocalInvocationID.x,head=gl_WorkGroupID.x,frame=gl_WorkGroupID.y*p.l;
+ float z=0;if(d<128){float x=s[frame+p.a+head*128+d];z+=x*x;}
+ float ss=subgroupAdd(z);if(gl_SubgroupInvocationID==0)red[gl_SubgroupID]=ss;barrier();
+ ss=subgroupAdd(gl_SubgroupInvocationID<8?red[gl_SubgroupInvocationID]:0);
+ float inv=inversesqrt(ss/128+1e-6);
+ if(d<128){float x=s[frame+p.a+head*128+d]*inv*uintBitsToFloat(w[p.c/4+d])*sigmoid(s[frame+p.d+head*128+d]);
+  s[frame+p.b+head*128+d]=x;finite_value(x);
+  float scale=min(subgroupMax(abs(x))/127,65504),v=scale==0?0:x/scale;
+  int q=int(clamp(sign(v)*floor(abs(v)+0.5),-127,127));float total=subgroupAdd(x);
+  uint lane=gl_SubgroupInvocationID,at=(lane&7)*4;
+  uint packed=(uint(subgroupShuffle(q,at))&255)|((uint(subgroupShuffle(q,at+1))&255)<<8)|((uint(subgroupShuffle(q,at+2))&255)<<16)|((uint(subgroupShuffle(q,at+3))&255)<<24);
+  uint outb=frame+p.f+(head*4+gl_SubgroupID)*9;
+  if(lane==0)s[outb]=uintBitsToFloat(packHalf2x16(vec2(scale,clamp(total,-65504,65504))));
+  if(lane<8)s[outb+lane+1]=uintBitsToFloat(packed);
+ }
+}

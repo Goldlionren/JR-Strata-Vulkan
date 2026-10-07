@@ -1,0 +1,7 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+#define JR_TYPE 42
+#define JR_GROUP_WIDTH 64
+#include "v11_expert_batch.glsl"

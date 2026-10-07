@@ -14,7 +14,7 @@ function(jr_compile_shader target_name shader_name)
     set(out "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader_name}.spv")
     set(shader_dependencies "${src}")
     if(shader_name MATCHES "^v(10|11)_")
-        if(shader_name MATCHES "^v11_expert_t")
+        if(shader_name MATCHES "^v11_(verify_expert[0-9]+_t|expert_t)")
             list(APPEND shader_dependencies "${CMAKE_CURRENT_SOURCE_DIR}/shaders/v11_expert_batch.glsl")
         endif()
         if(shader_name MATCHES "^v11_")
@@ -557,4 +557,111 @@ target_compile_options(jr-v11-expert-check PRIVATE -Wno-missing-field-initialize
 foreach(type 16 17 18 20 21 22 42)
     add_dependencies(jr-v11-expert-check jr_vk_v11_expert_t${type}_shader)
     target_compile_definitions(jr-v11-expert-check PRIVATE JR_TEST_T${type}="${jr_vk_v11_expert_t${type}_shader_SPV}")
+endforeach()
+
+# V11.1 verification-only producer/consumer fusion; uses existing buffers.
+jr_compile_shader(jr_vk_v11_verify_gdn_output_shader v11_verify_gdn_output.comp)
+jr_compile_shader(jr_vk_v11_verify_qsa_prepare_shader v11_verify_qsa_prepare.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_verify_gdn_output_shader jr_vk_v11_verify_qsa_prepare_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE
+    JR_V11_VERIFY_GDN_OUTPUT_SHADER="${jr_vk_v11_verify_gdn_output_shader_SPV}"
+    JR_V11_VERIFY_QSA_PREPARE_SHADER="${jr_vk_v11_verify_qsa_prepare_shader_SPV}")
+
+add_executable(jr-v11-verify-fusion-check ../tools/vulkan_v11_verify_fusion_check.cpp)
+target_link_libraries(jr-v11-verify-fusion-check PRIVATE jr_vk_runtime)
+target_include_directories(jr-v11-verify-fusion-check PRIVATE src ../include ../third_party/ggml)
+target_compile_options(jr-v11-verify-fusion-check PRIVATE -Wno-missing-field-initializers)
+add_dependencies(jr-v11-verify-fusion-check jr_vk_v11_verify_gdn_output_shader jr_vk_v11_verify_qsa_prepare_shader)
+target_compile_definitions(jr-v11-verify-fusion-check PRIVATE
+    JR_FUSION_NORM="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_norm_batch.comp.spv"
+    JR_FUSION_QROUND="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_qround_batch.comp.spv"
+    JR_FUSION_QSA_OPS="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_qsa_ops_batch.comp.spv"
+    JR_FUSION_GDN="${jr_vk_v11_verify_gdn_output_shader_SPV}"
+    JR_FUSION_QSA="${jr_vk_v11_verify_qsa_prepare_shader_SPV}")
+
+add_dependencies(jr-v11-verify-fusion-check jr_vk_v11_router_batch_shader)
+target_compile_definitions(jr-v11-verify-fusion-check PRIVATE
+    JR_FUSION_ROUTER_REF="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_router_batch.comp.spv"
+    JR_FUSION_ROUTER="${jr_vk_v11_router_batch_shader_SPV}")
+
+add_executable(jr-v11-dense-batch-check ../tools/vulkan_v11_dense_batch_check.cpp)
+target_link_libraries(jr-v11-dense-batch-check PRIVATE jr_vk_runtime)
+target_include_directories(jr-v11-dense-batch-check PRIVATE src ../include ../third_party/ggml)
+target_compile_options(jr-v11-dense-batch-check PRIVATE -Wno-missing-field-initializers)
+add_dependencies(jr-v11-dense-batch-check jr_vk_v11_dense_batch_shader jr_vk_v11_qround_batch_shader)
+target_compile_definitions(jr-v11-dense-batch-check PRIVATE
+    JR_DENSE_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_dense_batch.comp.spv"
+    JR_DENSE_CANDIDATE="${jr_vk_v11_dense_batch_shader_SPV}"
+    JR_DENSE_QROUND="${jr_vk_v11_qround_batch_shader_SPV}")
+
+target_compile_definitions(jr-v11-hc-check PRIVATE JR_HC_BATCH_DOWN_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_dense_small_batch.comp.spv")
+
+# Measured verification HC projection and late-prefix attention; no new buffers.
+jr_compile_shader(jr_vk_v11_verify_attn_tile_shader v11_verify_attn_tile.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_verify_attn_tile_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE
+    JR_V11_VERIFY_ATTN_TILE_SHADER="${jr_vk_v11_verify_attn_tile_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_verify_prefetch_shader v11_verify_prefetch.comp)
+add_dependencies(jr-v11-expert-check jr_vk_v11_verify_prefetch_shader)
+target_compile_definitions(jr-v11-expert-check PRIVATE JR_TEST_PREFETCH="${jr_vk_v11_verify_prefetch_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_verify_prefetch_group_shader v11_verify_prefetch_group.comp)
+add_dependencies(jr-v11-expert-check jr_vk_v11_verify_prefetch_group_shader)
+target_compile_definitions(jr-v11-expert-check PRIVATE JR_TEST_PREFETCH_GROUP="${jr_vk_v11_verify_prefetch_group_shader_SPV}")
+
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_verify_prefetch_shader jr_vk_v11_verify_prefetch_group_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE
+    JR_V11_VERIFY_PREFETCH_SHADER="${jr_vk_v11_verify_prefetch_shader_SPV}"
+    JR_V11_VERIFY_PREFETCH_GROUP_SHADER="${jr_vk_v11_verify_prefetch_group_shader_SPV}")
+
+jr_compile_shader(jr_vk_v11_verify_hc_output_shader v11_verify_hc_output.comp)
+add_dependencies(jr-v11-hc-check jr_vk_v11_verify_hc_output_shader jr_vk_v11_qround_batch_shader)
+target_compile_definitions(jr-v11-hc-check PRIVATE
+    JR_HC_BATCH_UP_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_hc_batch.comp.spv"
+    JR_HC_QROUND="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_qround_batch.comp.spv")
+
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_verify_hc_output_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_VERIFY_HC_OUTPUT_SHADER="${jr_vk_v11_verify_hc_output_shader_SPV}")
+
+add_executable(jr-v11-recurrent-check ../tools/vulkan_v11_recurrent_check.cpp)
+target_link_libraries(jr-v11-recurrent-check PRIVATE jr_vk_runtime)
+target_include_directories(jr-v11-recurrent-check PRIVATE src ../include ../third_party/ggml)
+target_compile_options(jr-v11-recurrent-check PRIVATE -Wno-missing-field-initializers)
+target_compile_definitions(jr-v11-recurrent-check PRIVATE JR_RECURRENT_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_gdn_batch.comp.spv")
+
+jr_compile_shader(jr_vk_v11_verify_hc_down_shader v11_verify_hc_down.comp)
+add_dependencies(jr-v11-hc-check jr_vk_v11_verify_hc_down_shader)
+
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_verify_hc_down_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_VERIFY_HC_DOWN_SHADER="${jr_vk_v11_verify_hc_down_shader_SPV}")
+
+add_executable(jr-v11-gdn-prepare-check ../tools/vulkan_v11_gdn_prepare_check.cpp)
+target_link_libraries(jr-v11-gdn-prepare-check PRIVATE jr_vk_runtime)
+target_include_directories(jr-v11-gdn-prepare-check PRIVATE src ../include ../third_party/ggml)
+target_compile_options(jr-v11-gdn-prepare-check PRIVATE -Wno-missing-field-initializers)
+target_compile_definitions(jr-v11-gdn-prepare-check PRIVATE
+ JR_PREPARE_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_gdn_prepare_batch.comp.spv"
+ JR_PREPARE_NORM_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_norm_batch.comp.spv")
+
+add_executable(jr-v11-qsa-score-check ../tools/vulkan_v11_qsa_score_check.cpp)
+target_link_libraries(jr-v11-qsa-score-check PRIVATE jr_vk_runtime)
+target_include_directories(jr-v11-qsa-score-check PRIVATE src ../include ../third_party/ggml)
+target_compile_options(jr-v11-qsa-score-check PRIVATE -Wno-missing-field-initializers)
+target_compile_definitions(jr-v11-qsa-score-check PRIVATE JR_SCORE_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/../build-vulkan/shaders/v11_ops.comp.spv")
+
+jr_compile_shader(jr_vk_v11_verify_qsa_score_shader v11_verify_qsa_score.comp)
+add_dependencies(jr-vk-runtime-v11 jr_vk_v11_verify_qsa_score_shader)
+target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_VERIFY_QSA_SCORE_SHADER="${jr_vk_v11_verify_qsa_score_shader_SPV}")
+
+# Wider grouped gate/up verification; native down modules retain 32 threads.
+foreach(type 16 17 18 20 21 22 42)
+    jr_compile_shader(jr_vk_v11_verify_expert64_t${type}_shader v11_verify_expert64_t${type}.comp)
+    add_dependencies(jr-vk-runtime-v11 jr_vk_v11_verify_expert64_t${type}_shader)
+    target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT64_T${type}_SHADER="${jr_vk_v11_verify_expert64_t${type}_shader_SPV}")
+endforeach()
+foreach(type 18 21)
+    jr_compile_shader(jr_vk_v11_verify_expert128_t${type}_shader v11_verify_expert128_t${type}.comp)
+    add_dependencies(jr-vk-runtime-v11 jr_vk_v11_verify_expert128_t${type}_shader)
+    target_compile_definitions(jr-vk-runtime-v11 PRIVATE JR_V11_EXPERT128_T${type}_SHADER="${jr_vk_v11_verify_expert128_t${type}_shader_SPV}")
 endforeach()

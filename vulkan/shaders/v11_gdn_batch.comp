@@ -10,7 +10,7 @@ void main(){uint lane=gl_SubgroupInvocationID,h=gl_WorkGroupID.y,j=gl_WorkGroupI
  for(uint t=0;t<p.o;t++){uint offset=t*p.l;float kr[4],qr[4],dotv=0;float dec=s[offset+p.c+h],beta=s[offset+p.d+h];
   for(uint r=0;r<4;r++){uint i=r*32+lane;kr[r]=s[offset+p.a+2048+qh*128+i];qr[r]=s[offset+p.a+qh*128+i];dotv+=v[r]*kr[r];}
   float delta=(s[offset+p.a+4096+h*128+j]-dec*subgroupAdd(dotv))*beta,outputv=0;
-  for(uint r=0;r<4;r++){v[r]=v[r]*dec+kr[r]*delta;outputv+=v[r]*qr[r];finite_value(v[r]);if(t<4)snaps[t*p.i+p.j+base+r*32+lane]=v[r];}
+  for(uint r=0;r<4;r++){v[r]=v[r]*dec+kr[r]*delta;outputv+=v[r]*qr[r];finite_value(v[r]);if(t<4&&t+1<p.o&&p.i!=0)snaps[t*p.i+p.j+base+r*32+lane]=v[r];}
   float result=subgroupAdd(outputv);if(lane==0)s[offset+p.b+h*128+j]=result*inversesqrt(128.0);
  }
  for(uint r=0;r<4;r++)st[base+r*32+lane]=v[r];

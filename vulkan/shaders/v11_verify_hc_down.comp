@@ -1,0 +1,32 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#include "v11_common.glsl"
+layout(local_size_x=128) in;
+layout(constant_id=0) const uint FORMAT=1280;
+const uint COLUMNS=FORMAT>>8;
+shared float sums[8*COLUMNS];
+// The HC projection always has 10,240 BF16 columns. Keep all 256 virtual lanes
+// and their exact sums while removing generic type/width/bounds branches.
+void main(){uint lane=gl_LocalInvocationID.x,row=gl_WorkGroupID.x;
+ uint base=row>=320?p.i+(row-320)*20480:p.a+row*20480;
+ float lower[COLUMNS],upper[COLUMNS];[[unroll]] for(uint t=0;t<COLUMNS;t++){lower[t]=0;upper[t]=0;}
+ for(uint i=lane*2;i<10240;i+=512){
+  uint lo=w[base/4+i/2],hi=w[base/4+(i+256)/2];
+  vec2 a=vec2(uintBitsToFloat(lo<<16),uintBitsToFloat(lo&0xffff0000u));
+  vec2 b=vec2(uintBitsToFloat(hi<<16),uintBitsToFloat(hi&0xffff0000u));
+  [[unroll]] for(uint t=0;t<COLUMNS;t++){
+   lower[t]+=a.x*s[t*p.l+p.b+i]+a.y*s[t*p.l+p.b+i+1];
+   upper[t]+=b.x*s[t*p.l+p.b+i+256]+b.y*s[t*p.l+p.b+i+257];
+  }
+ }
+ [[unroll]] for(uint t=0;t<COLUMNS;t++){
+  float lo=subgroupAdd(lower[t]),hi=subgroupAdd(upper[t]);
+  if(gl_SubgroupInvocationID==0){sums[t*8+gl_SubgroupID]=lo;sums[t*8+gl_SubgroupID+4]=hi;}
+ }
+ barrier();if(gl_SubgroupID==0)[[unroll]] for(uint t=0;t<COLUMNS;t++){
+  float sum=subgroupAdd(lane<8?sums[t*8+lane]:0);
+  if(lane==0){if(row>=320)s[t*p.l+p.j+row-320]=sum;else s[t*p.l+p.c+row]=silu(sum*0.25);finite_value(sum);}
+ }
+}

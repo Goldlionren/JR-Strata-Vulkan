@@ -152,10 +152,11 @@ struct Layer {
   std::array<RowPath, 6> paths;
   std::array<std::map<uint32_t, Pipeline>, 6> batch_dense, batch_small;
   Pipeline batch_gdn;
-  std::array<Pipeline, 6> batch_gu, batch_down, batch_hc;
+  std::array<Pipeline, 6> batch_gu, batch_down, batch_hc, batch_hc_down;
   Pipeline batch_norm, batch_qround, batch_gdn_prepare, batch_qsa_ops,
-      batch_attn;
-  Pipeline batch_router, batch_selection;
+      batch_attn, batch_attn_tile;
+  Pipeline batch_router, batch_selection, batch_gdn_output, batch_qsa_prepare,
+      batch_qsa_score, verify_prefetch;
   uint32_t gu_type = 0, d_type = 0;
 };
 struct Checkpoint {
@@ -1195,6 +1196,10 @@ public:
       layers_[49].paths[5].attn =
           make_pipeline(ctx_, JR_V11_MTP_ATTN_SHADER, md, sizeof(Push));
     }
+    auto staged_weights = info(snapshots_, snapshot_stride_);
+    staged_weights.offset = 3 * snapshot_stride_;
+    auto staged_meta = info(scratch_, 50 * 8 * 4);
+    staged_meta.offset = uint64_t(w_.xn) * 4;
     if (a_.spec) {
       batch_swiglu_ = make_pipeline(ctx_, JR_V11_SWIGLU_BATCH_SHADER,
                                     {info(gu_), info(hq_), info(scratch_)}, 32);
@@ -1204,8 +1209,9 @@ public:
       group_meta_ = buffer(50 * 8 * 4);
       group_slots_ = buffer(520 * 4, false, true);
       group_routes_ = make_pipeline(
-          ctx_, JR_V11_EXPERT_GROUP_SHADER,
-          {info(route_), info(group_meta_), info(group_slots_)}, 16);
+          ctx_, JR_V11_VERIFY_PREFETCH_GROUP_SHADER,
+          {info(route_), info(group_meta_), info(group_slots_),
+           staged_meta}, 16);
     }
     if (a_.spec)
       for (uint32_t l = 0; l < 49; l++) {
@@ -1221,10 +1227,16 @@ public:
         if (l % 4 == 3 && l < 48) {
           layers_[l].batch_selection = make_pipeline(
               ctx_, JR_V11_QSA_SELECT_BATCH_SHADER, bd, sizeof(Push));
+          layers_[l].batch_qsa_prepare = make_pipeline(
+              ctx_, JR_V11_VERIFY_QSA_PREPARE_SHADER, bd, sizeof(Push));
+          layers_[l].batch_qsa_score = make_pipeline(
+              ctx_, JR_V11_VERIFY_QSA_SCORE_SHADER, bd, sizeof(Push), 32);
           layers_[l].batch_qsa_ops = make_pipeline(
               ctx_, JR_V11_QSA_OPS_BATCH_SHADER, bd, sizeof(Push));
           layers_[l].batch_attn =
               make_pipeline(ctx_, JR_V11_ATTN_BATCH_SHADER, bd, sizeof(Push));
+          layers_[l].batch_attn_tile = make_pipeline(
+              ctx_, JR_V11_VERIFY_ATTN_TILE_SHADER, bd, sizeof(Push));
         }
         layers_[l].batch_norm =
             make_pipeline(ctx_, JR_V11_NORM_BATCH_SHADER, bd, sizeof(Push));
@@ -1235,47 +1247,85 @@ public:
             uint32_t format = t.type | (n << 8);
             if (!layers_[l].batch_dense[n].contains(t.type))
               layers_[l].batch_dense[n].emplace(
-                  t.type, make_pipeline(ctx_, JR_V11_DENSE_BATCH_SHADER, bd,
-                                        sizeof(Push), 32, &format));
+                  t.type,
+                  make_pipeline(ctx_, JR_V11_DENSE_BATCH_SHADER, bd,
+                                sizeof(Push), t.type == 13 ? 32 : 16, &format));
             if ((t.type == 0 || t.type == 30 || t.type == 1) &&
                 !layers_[l].batch_small[n].contains(t.type))
               layers_[l].batch_small[n].emplace(
                   t.type, make_pipeline(ctx_, JR_V11_SMALL_BATCH_SHADER, bd,
                                         sizeof(Push), 32, &format));
           }
-          layers_[l].batch_hc[n] = make_pipeline(ctx_, JR_V11_HC_BATCH_SHADER,
-                                                 bd, sizeof(Push), 32, &n);
+          uint32_t hc_format = 30 | (n << 8);
+          layers_[l].batch_hc_down[n] =
+              make_pipeline(ctx_, JR_V11_VERIFY_HC_DOWN_SHADER, bd,
+                            sizeof(Push), 32, &hc_format);
+          layers_[l].batch_hc[n] = make_pipeline(
+              ctx_, JR_V11_VERIFY_HC_OUTPUT_SHADER, bd, sizeof(Push), 32, &n);
         }
         if (l % 4 != 3 && l < 48) {
+          layers_[l].batch_gdn_output = make_pipeline(
+              ctx_, JR_V11_VERIFY_GDN_OUTPUT_SHADER, bd, sizeof(Push));
           layers_[l].batch_gdn_prepare = make_pipeline(
-              ctx_, JR_V11_GDN_PREPARE_BATCH_SHADER, bd, sizeof(Push));
+              ctx_, JR_V11_GDN_PREPARE_BATCH_SHADER, bd, sizeof(Push), 32);
           layers_[l].batch_gdn =
               make_pipeline(ctx_, JR_V11_GDN_BATCH_SHADER, bd, sizeof(Push));
         }
         if (l < 48) {
           auto &z = layers_[l];
-          auto gd = [&](VkDescriptorBufferInfo input, Buffer &output) {
+          uint64_t gu_bytes = uint64_t(FF) * row_bytes_for(z.gu_type, E),
+                   down_bytes = uint64_t(E) * row_bytes_for(z.d_type, FF);
+          if (40 * (2 * gu_bytes + down_bytes) > snapshot_stride_ ||
+              gu_bytes % 16 || down_bytes % 16)
+            throw std::runtime_error(
+                "native verification staging exceeds unused snapshot");
+          z.verify_prefetch =
+              make_pipeline(ctx_, JR_V11_VERIFY_PREFETCH_SHADER,
+                            {info(z.ram), info(group_meta_), info(group_slots_),
+                             staged_weights, staged_meta},
+                            8);
+          auto gd = [&](VkDescriptorBufferInfo input, Buffer &output,
+                        bool prefetch) {
             return std::vector<VkDescriptorBufferInfo>{
-                info(z.ram),         info(z.vram),        input,
-                info(output),        info(group_meta_),   info(tables_.iq2xxs),
-                info(tables_.iq2xs), info(tables_.iq2s),  info(tables_.iq3xxs),
-                info(tables_.iq3s),  info(tables_.signs), info(tables_.iq4),
-                info(group_slots_),  info(scratch_)};
+                prefetch ? staged_weights : info(z.ram),
+                info(z.vram),
+                input,
+                info(output),
+                prefetch ? staged_meta : info(group_meta_),
+                info(tables_.iq2xxs),
+                info(tables_.iq2xs),
+                info(tables_.iq2s),
+                info(tables_.iq3xxs),
+                info(tables_.iq3s),
+                info(tables_.signs),
+                info(tables_.iq4),
+                info(group_slots_),
+                info(scratch_)};
           };
           auto input = info(scratch_, scratch_.size - w_.round * 4);
           input.offset = w_.round * 4;
-          uint32_t expert_columns = 5;
           for (uint32_t n = 1; n <= 5; n++) {
             // Two-position IQ3 windows use fewer registers. Real-weight checks
             // measured a 5-8% gate/up gain with identical FP32 output bits.
             uint32_t gu_columns =
-                n == 2 && (z.gu_type == 18 || z.gu_type == 21) ? 2 : 5;
-            z.batch_gu[n] =
-                make_pipeline(ctx_, batch_expert_shader(z.gu_type),
-                              gd(input, gu_), 32, 32, &gu_columns);
-            z.batch_down[n] =
-                make_pipeline(ctx_, batch_expert_shader(z.d_type),
-                              gd(info(hq_), parts_), 32, 32, &expert_columns);
+                n == 3
+                    ? 3
+                    : (n == 2 && (z.gu_type == 18 || z.gu_type == 21) ? 2 : 5);
+            gu_columns |= n << 8;
+            uint32_t down_format = 5 | (n << 8);
+            uint32_t gu_subgroup =
+                (n == 3 &&
+                 (z.gu_type == 16 || z.gu_type == 17 || z.gu_type == 22)) ||
+                        (n == 2 && (z.gu_type == 18 || z.gu_type == 21))
+                    ? 32
+                    : 16;
+            z.batch_gu[n] = make_pipeline(
+                ctx_,
+                batch_expert_shader(z.gu_type, batch_gate_rows(z.gu_type, n)),
+                gd(input, gu_, n <= 4), 32, gu_subgroup, &gu_columns);
+            z.batch_down[n] = make_pipeline(ctx_, batch_expert_shader(z.d_type),
+                                            gd(info(hq_), parts_, n <= 4), 32,
+                                            32, &down_format);
           }
         }
       }

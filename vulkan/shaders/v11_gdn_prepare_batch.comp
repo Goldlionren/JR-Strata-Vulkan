@@ -1,24 +1,30 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #include "v11_common.glsl"
 layout(local_size_x=256) in;
-// Channel-local convolution is causal across the window. Preserve its exact
-// four-term arithmetic and save only rollback prefixes, without transfer passes.
-void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=10240)return;
+shared float reductions[8];
+// Two 128-channel Q/K heads per group. Each retains the RC's four
+// nonzero subgroup partials and its final 32-lane sum, padded with zeros.
+void main(){uint idx=gl_GlobalInvocationID.x,lane=gl_LocalInvocationID.x;
  uint state=p.c+idx*3;float a=st[state],b=st[state+1],c=st[state+2];
+ vec4 weights=vec4(uintBitsToFloat(w[p.d/4+idx*4]),uintBitsToFloat(w[p.d/4+idx*4+1]),
+                   uintBitsToFloat(w[p.d/4+idx*4+2]),uintBitsToFloat(w[p.d/4+idx*4+3]));
+ float dt=idx<48?uintBitsToFloat(w[p.g/4+idx]):0,aa=idx<48?uintBitsToFloat(w[p.h/4+idx]):0;
  for(uint t=0;t<p.o;t++){uint frame=t*p.l;float x=s[frame+p.a+idx],v=0;
-  v+=a*uintBitsToFloat(w[p.d/4+idx*4]);
-  v+=b*uintBitsToFloat(w[p.d/4+idx*4+1]);
-  v+=c*uintBitsToFloat(w[p.d/4+idx*4+2]);
-  v+=x*uintBitsToFloat(w[p.d/4+idx*4+3]);
-  finite_value(v);
-  s[frame+p.b+idx]=silu(v);a=b;b=c;c=x;
-  if(t<4){uint save=t*p.i+p.j+state;snaps[save]=a;snaps[save+1]=b;snaps[save+2]=c;}
-  if(idx<48){float alpha=s[frame+p.e+idx]+uintBitsToFloat(w[p.g/4+idx]);
-   float sp=alpha>20?alpha:log(1+exp(alpha));
-   float decay=exp(sp*uintBitsToFloat(w[p.h/4+idx]));finite_value(decay);
-   s[frame+p.e+idx]=decay;
-   s[frame+p.f+idx]=sigmoid(s[frame+p.f+idx]);}
+  v+=a*weights.x;v+=b*weights.y;v+=c*weights.z;v+=x*weights.w;
+  finite_value(v);float value=silu(v);
+  if(gl_WorkGroupID.x<16){float sum=subgroupAdd(value*value);
+   if(gl_SubgroupInvocationID==0)reductions[gl_SubgroupID]=sum;barrier();
+   uint head=lane/128;float ss=subgroupAdd(gl_SubgroupInvocationID<4?reductions[head*4+gl_SubgroupInvocationID]:0);
+   value=value*inversesqrt(ss+1e-6)*1;
+   barrier(); // All groups finish reading before the next position reuses reductions.
+  }
+  s[frame+p.b+idx]=value;a=b;b=c;c=x;
+  if(t<4&&t+1<p.o&&p.i!=0){uint save=t*p.i+p.j+state;snaps[save]=a;snaps[save+1]=b;snaps[save+2]=c;}
+  if(idx<48){float alpha=s[frame+p.e+idx]+dt;
+   float sp=alpha>20?alpha:log(1+exp(alpha));float decay=exp(sp*aa);finite_value(decay);
+   s[frame+p.e+idx]=decay;s[frame+p.f+idx]=sigmoid(s[frame+p.f+idx]);}
  }
  st[state]=a;st[state+1]=b;st[state+2]=c;
 }

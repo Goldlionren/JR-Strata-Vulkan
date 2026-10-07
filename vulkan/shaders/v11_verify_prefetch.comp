@@ -1,0 +1,19 @@
+#version 460
+layout(local_size_x=128) in;
+layout(set=0,binding=0,std430) readonly buffer NativeRam {uvec4 ram[];};
+layout(set=0,binding=1,std430) readonly buffer NativeMeta {uint meta[];};
+layout(set=0,binding=2,std430) readonly buffer Slots {uint slots[];};
+layout(set=0,binding=3,std430) writeonly buffer Stage {uvec4 staged[];};
+layout(set=0,binding=4,std430) writeonly buffer StageMeta {uint out_meta[];};
+layout(push_constant) uniform Push {uint gu_bytes,down_bytes;} p;
+// Copy native bytes without decoding, conversion or a second weight residency.
+void main(){uint rank=slots[250+gl_WorkGroupID.y],role=gl_WorkGroupID.z;
+ uint blob=2*p.gu_bytes+p.down_bytes,bytes=role==2?p.down_bytes:p.gu_bytes;
+ uint source=meta[rank*8+3+role]/16,dest=(rank*blob+(role==2?2*p.gu_bytes:role*p.gu_bytes))/16;
+ for(uint i=gl_GlobalInvocationID.x;i<bytes/16;i+=gl_NumWorkGroups.x*128)staged[dest+i]=ram[source+i];
+ if(gl_WorkGroupID.x==0&&gl_LocalInvocationID.x==0&&role==0){
+  for(uint f=0;f<8;f++)out_meta[rank*8+f]=meta[rank*8+f];
+  out_meta[rank*8+3]=rank*blob;out_meta[rank*8+4]=rank*blob+p.gu_bytes;
+  out_meta[rank*8+5]=rank*blob+2*p.gu_bytes;
+ }
+}

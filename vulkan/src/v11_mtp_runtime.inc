@@ -165,8 +165,8 @@ void batch_gemv(uint32_t l, const std::string &name, uint32_t in, uint32_t out,
     run(layers_[l].batch_small[verify_rows_].at(t.type), rows, 1, &p, sizeof(p),
         !independent);
   else
-    run(layers_[l].batch_dense[verify_rows_].at(t.type), (rows + 3) / 4, 1, &p,
-        sizeof(p), !independent);
+    run(layers_[l].batch_dense[verify_rows_].at(t.type), (rows + 15) / 16, 1,
+        &p, sizeof(p), !independent);
 }
 void batch_hc_read(uint32_t l, const std::string &prefix, bool apply = false) {
   auto &gamma = named(l, prefix + "norm.weight", HC);
@@ -186,12 +186,16 @@ void batch_hc_read(uint32_t l, const std::string &prefix, bool apply = false) {
           w_.inject};
   dp.l = w_.end;
   dp.o = verify_rows_;
-  run(layers_[l].batch_small[verify_rows_].at(30), dp.e, 1, &dp, sizeof(dp));
+  run(layers_[l].batch_hc_down[verify_rows_], dp.e, 1, &dp, sizeof(dp));
   auto &up = named(l, prefix + "up.weight", 320, HC);
   Push hp{0, up.off, w_.lo, w_.mixed, w_.xn};
   hp.l = w_.end;
   hp.o = verify_rows_;
-  run(layers_[l].batch_hc[verify_rows_], E / 4, 1, &hp, sizeof(hp));
+  hp.f = w_.round;
+  hp.n = finite_at();
+  run(layers_[l].batch_hc[verify_rows_], E / 32, 1, &hp, sizeof(hp));
+  batch_input_ = w_.mixed;
+  batch_cols_ = E;
 }
 void transfer_barrier(bool to_transfer) {
   VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -207,7 +211,8 @@ void transfer_barrier(bool to_transfer) {
                        0, 1, &b, 0, nullptr, 0, nullptr);
 }
 void snapshot_tail(uint32_t l, uint32_t row, bool entire = false) {
-  if (row == 4) return;
+  if (row == 4 || row + 1 == verify_rows_)
+    return;
   uint64_t start = entire ? 0 : 128ull * 48 * 128 * 4;
   transfer_barrier(true);
   VkBufferCopy cp{start, row * snapshot_stride_ + snapshot_offset_[l] + start,
@@ -222,20 +227,17 @@ void batch_gdn(uint32_t l) {
   batch_gemv(l, "attn_gate.weight", w_.mixed, w_.z, E, 6144);
   auto &cw = named(l, "ssm_conv1d.weight", 4, HC),
        &dt = named(l, "ssm_dt.bias", 48), &aa = named(l, "ssm_a", 48);
-  Push prep{0, w_.qkv, w_.h, 128 * 48 * 128, cw.off,
+  Push prep{0,        w_.qkv,  w_.h,   128 * 48 * 128, cw.off,
             w_.alpha, w_.beta, dt.off, aa.off};
-  prep.i = snapshot_stride_ / 4;
+  prep.i = verify_rows_ == 1 ? 0 : snapshot_stride_ / 4;
   prep.j = snapshot_offset_[l] / 4;
   prep.l = w_.end;
   prep.o = verify_rows_;
   prep.n = finite_at();
   run(layers_[l].batch_gdn_prepare, 40, 1, &prep, sizeof(prep));
-  Push qkn{1, w_.h, w_.h, 0, 128, 32, 0, 1};
-  qkn.l = w_.end;
-  run(layers_[l].batch_norm, 32, verify_rows_, &qkn, sizeof(qkn));
   batch_input_ = rounded_input_ = UINT32_MAX;
   Push p{0, w_.h, w_.rec, w_.alpha, w_.beta};
-  p.i = snapshot_stride_ / 4;
+  p.i = verify_rows_ == 1 ? 0 : snapshot_stride_ / 4;
   p.j = snapshot_offset_[l] / 4;
   p.l = w_.end;
   p.o = verify_rows_;
@@ -244,8 +246,12 @@ void batch_gdn(uint32_t l) {
   auto &gn = named(l, "ssm_norm.weight", 128);
   Push np{7, w_.rec, w_.y, gn.off, w_.z};
   np.l = w_.end;
-  run(layers_[l].batch_norm, 48, verify_rows_, &np, sizeof(np));
-  batch_input_ = rounded_input_ = UINT32_MAX;
+  np.f = w_.round;
+  np.n = finite_at();
+  run(layers_[l].batch_gdn_output, 48, verify_rows_, &np, sizeof(np));
+  rounded_input_ = UINT32_MAX;
+  batch_input_ = w_.y;
+  batch_cols_ = 6144;
   batch_gemv(l, "ssm_out.weight", w_.y, w_.block, 6144, E, true);
 }
 void qsa_body(uint32_t l, bool draft = false) {
@@ -290,34 +296,47 @@ void batch_qsa(uint32_t l) {
     run(layers_[l].batch_qsa_ops, groups, verify_rows_, &p, sizeof(p));
     batch_input_ = rounded_input_ = UINT32_MAX;
   };
-  auto qnorm = [&](uint32_t in, uint32_t cols, uint32_t heads, const Tensor &gamma) {
-    Push p{1, in, in, gamma.off, cols, heads, 1};
+  auto prepare = [&](uint32_t op, uint32_t in, uint32_t out,
+                     const Tensor &gamma, uint32_t width, uint32_t heads,
+                     bool synchronize) {
+    Push p{op, in, out, gamma.off, width, w_.vcur, a_.context};
     p.l = w_.end;
-    run(layers_[l].batch_norm, heads, verify_rows_, &p, sizeof(p));
+    p.k = ctl_stride_ / 4;
+    run(layers_[l].batch_qsa_prepare, heads, verify_rows_, &p, sizeof(p),
+        synchronize);
     batch_input_ = rounded_input_ = UINT32_MAX;
   };
-  qnorm(w_.kcur, 256, 2, named(l, "attn_k_norm.weight", 256));
-  qops({9, w_.kcur, 256, 2}, 1);
-  qops({10, w_.kcur, w_.vcur, 0, a_.context}, 1);
-  qops({8, w_.qfull, w_.q}, 24);
-  qnorm(w_.q, 256, 24, named(l, "attn_q_norm.weight", 256));
-  qops({9, w_.q, 256, 24}, 3);
-  qnorm(w_.idxq, 128, 4, named(l, "indexer.q_norm.weight", 128));
-  qops({9, w_.idxq, 128, 4}, 1);
+  prepare(1, w_.kcur, w_.kcur, named(l, "attn_k_norm.weight", 256), 256, 2,
+          false);
+  prepare(0, w_.qfull, w_.q, named(l, "attn_q_norm.weight", 256), 256, 24,
+          false);
+  prepare(2, w_.idxq, w_.idxq, named(l, "indexer.q_norm.weight", 128), 128, 4,
+          true);
   auto &ikn = named(l, "indexer.k_norm.weight", 128);
   each_row(verify_rows_, [&](uint32_t row) {
     ops(l, {11, w_.idxraw, 0, ikn.off, 512, 384});
-    ops(l, {12, w_.idxq, 512, 384, w_.scores}, a_.context / 4 + 1, 8);
     snapshot_tail(l, row, true);
   });
+  // A later pooled-key append only modifies blocks at or above an earlier
+  // position's nb. Earlier positions read rows strictly below nb and use the
+  // fixed spare key for their tail, so all window scores can run together.
+  Push score{12, w_.idxq, 512, 384, w_.scores};
+  score.l = w_.end;
+  score.k = ctl_stride_ / 4;
+  run(layers_[l].batch_qsa_score, 1, 1, &score, sizeof(score), true,
+      16 + 2 * E + 12);
   Push selection{0, w_.scores, 0, w_.selected};
   selection.l = w_.end;
   selection.k = ctl_stride_ / 4;
-  run(layers_[l].batch_selection, 1, 1, &selection, sizeof(selection), true, 16 + 2 * E + 8);
+  run(layers_[l].batch_selection, 1, 1, &selection, sizeof(selection), true,
+      16 + 2 * E + 8);
   Push ap{0, w_.q, w_.partial, w_.selected, 0, a_.context};
   ap.l = w_.end;
   ap.k = ctl_stride_ / 4;
-  run(layers_[l].batch_attn, 1, 1, &ap, sizeof(ap), true, 16 + 2 * E);
+  // Existing reserved control words select exactly one attention producer.
+  // Keep the RC kernel for a whole window crossing the 512-position boundary.
+  run(layers_[l].batch_attn, 1, 1, &ap, sizeof(ap), false, 16 + 2 * E);
+  run(layers_[l].batch_attn_tile, 1, 1, &ap, sizeof(ap), true, 16 + 2 * E + 3);
   ap = {1, w_.partial, w_.attn};
   ap.l = w_.end;
   ap.k = ctl_stride_ / 4;
@@ -325,7 +344,38 @@ void batch_qsa(uint32_t l) {
   qops({14, w_.attn, w_.qfull, w_.y}, 24);
   batch_gemv(l, "attn_output.weight", w_.y, w_.block, 6144, E, true);
 }
-const char *batch_expert_shader(uint32_t type) {
+uint32_t batch_gate_rows(uint32_t type, uint32_t n) {
+  if (n == 2 && (type == 18 || type == 21))
+    return 16;
+  if (n == 3 || (n == 2 && type == 17))
+    return 8;
+  return 4;
+}
+const char *batch_expert_shader(uint32_t type, uint32_t rows = 4) {
+  if (rows == 16) {
+    if (type == 18)
+      return JR_V11_EXPERT128_T18_SHADER;
+    if (type == 21)
+      return JR_V11_EXPERT128_T21_SHADER;
+    throw std::runtime_error("unsupported sixteen-row verification format");
+  }
+  if (rows == 8) {
+    switch (type) {
+#define V11_WIDE_CASE(t)                                                       \
+  case t:                                                                      \
+    return JR_V11_EXPERT64_T##t##_SHADER;
+      V11_WIDE_CASE(16)
+      V11_WIDE_CASE(17)
+      V11_WIDE_CASE(18)
+      V11_WIDE_CASE(20)
+      V11_WIDE_CASE(21)
+      V11_WIDE_CASE(22)
+      V11_WIDE_CASE(42)
+#undef V11_WIDE_CASE
+    default:
+      throw std::runtime_error("unsupported eight-row verification format");
+    }
+  }
   switch (type) {
 #define V11_EXPERT_CASE(t)                                                     \
   case t:                                                                      \
@@ -338,8 +388,8 @@ const char *batch_expert_shader(uint32_t type) {
     V11_EXPERT_CASE(22)
     V11_EXPERT_CASE(42)
 #undef V11_EXPERT_CASE
-        default
-        : throw std::runtime_error("unsupported V11 native batch expert type");
+  default:
+    throw std::runtime_error("unsupported V11 native batch expert type");
   }
 }
 void batch_expert(Pipeline &pipe, const std::array<uint32_t, 8> &push,
@@ -361,10 +411,16 @@ void batch_moe(uint32_t l) {
   rp.k = route_stride_ / 4;
   rp.m = weights_stride_ / 4;
   rp.d = 65536 / 4;
-  run(layers_[l].batch_router, 1, verify_rows_, &rp, sizeof(rp));
+  // Routing and Q8 packing are independent consumers of the ready mixed
+  // input. One completion barrier covers both before grouped execution.
+  run(layers_[l].batch_router, 1, verify_rows_, &rp, sizeof(rp), false);
+  bool already_rounded = batch_input_ == w_.mixed && batch_cols_ == E;
   prepare_batch_input(l, w_.mixed, E);
-  std::array<uint32_t, 4> group{verify_rows_, uint32_t(route_stride_ / 4),
-                                2 * FF / 4, E / 4};
+  if (already_rounded)
+    barrier();
+  std::array<uint32_t, 4> group{
+      verify_rows_, uint32_t(route_stride_ / 4),
+      2 * FF / batch_gate_rows(layers_[l].gu_type, verify_rows_), E / 4};
   run(group_routes_, 1, 1, group.data(), 16, false);
   VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   ready.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -374,6 +430,23 @@ void batch_moe(uint32_t l) {
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                        0, 1, &ready, 0, nullptr, 0, nullptr);
+  // For N <= 4, prefix record 3 cannot be a restore point. Stream the
+  // needed native host bytes through that existing workspace, then read them
+  // with the unchanged expert decoder. N=5 retains all four live snapshots.
+  if (verify_rows_ <= 4) {
+    batch_mark(verify_rows_, "verify native prefetch");
+    std::array<uint32_t, 2> cp{
+        uint32_t(FF * row_bytes_for(layers_[l].gu_type, E)),
+        uint32_t(E * row_bytes_for(layers_[l].d_type, FF))};
+    auto &prefetch = layers_[l].verify_prefetch;
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, prefetch.pipeline);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            prefetch.layout, 0, 1, &prefetch.set, 0, nullptr);
+    vkCmdPushConstants(cmd_, prefetch.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8,
+                       cp.data());
+    vkCmdDispatchIndirect(cmd_, group_slots_.buffer, 508 * 4);
+    barrier();
+  }
   std::array<uint32_t, 8> gp{
       verify_rows_ * K,         E, FF, 0, verify_rows_, w_.end,
       uint32_t(gu_stride_ / 4), 0};
@@ -382,9 +455,14 @@ void batch_moe(uint32_t l) {
   batch_gemv(l, "ffn_gate_shexp.weight", w_.mixed, w_.shg, E, FF, false, true);
   batch_gemv(l, "ffn_up_shexp.weight", w_.mixed, w_.shu, E, FF);
   batch_mark(verify_rows_, "verify SwiGLU");
-  std::array<uint32_t, 8> sw{K, FF, uint32_t(gu_stride_ / 4),
-                           uint32_t(hq_stride_ / 4), w_.end,
-                           w_.shg, w_.shu, w_.shh};
+  std::array<uint32_t, 8> sw{K,
+                             FF,
+                             uint32_t(gu_stride_ / 4),
+                             uint32_t(hq_stride_ / 4),
+                             w_.end,
+                             w_.shg,
+                             w_.shu,
+                             w_.shh};
   run(batch_swiglu_, FF / 32, K * verify_rows_, sw.data(), 32);
   batch_input_ = rounded_input_ = UINT32_MAX;
   batch_mark(verify_rows_, "verify expert down/shared");
@@ -396,9 +474,16 @@ void batch_moe(uint32_t l) {
   batch_gemv(l, "ffn_down_shexp.weight", w_.shh, w_.sho, FF, E, false, true);
   batch_gemv(l, "ffn_gate_inp_shexp.weight", w_.mixed, w_.shgate, E, 1);
   batch_mark(verify_rows_, "verify combine");
-  std::array<uint32_t, 10> combine{K, E, uint32_t(parts_stride_ / 4),
-                                 uint32_t(weights_stride_ / 4), w_.end,
-                                 w_.moe, w_.sho, w_.shgate, w_.block, finite_at()};
+  std::array<uint32_t, 10> combine{K,
+                                   E,
+                                   uint32_t(parts_stride_ / 4),
+                                   uint32_t(weights_stride_ / 4),
+                                   w_.end,
+                                   w_.moe,
+                                   w_.sho,
+                                   w_.shgate,
+                                   w_.block,
+                                   finite_at()};
   run(batch_combine_, 10, verify_rows_, combine.data(), 40);
   batch_input_ = rounded_input_ = UINT32_MAX;
 }
@@ -556,7 +641,8 @@ void initialize_mtp_commands() {
     each_row(n, [&](uint32_t) {
       Push ep{0, w_.R, 0};
       ep.n = finite_at();
-      run(embedding_[active_row_], 40, 1, &ep, sizeof(ep));
+      run(embedding_[active_row_], 40, 1, &ep, sizeof(ep),
+          active_row_ + 1 == n);
     });
     for (uint32_t l = 0; l < 48; l++) {
       batch_mark(n, "PLE");
@@ -564,7 +650,8 @@ void initialize_mtp_commands() {
         each_row(n, [&](uint32_t row) {
           ops(l, {4, w_.R, w_.block, w_.inject}, 40);
           ple();
-          if (row == 4) return;
+          if (row == 4 || row + 1 == n)
+            return;
           transfer_barrier(true);
           uint64_t start = (128ull * 48 * 128 + HC * 3) * 4;
           VkBufferCopy cp{start,
@@ -814,8 +901,11 @@ WindowResult round(uint32_t id, uint32_t limit, bool emit = true) {
   metrics_.window_sizes[n - 1]++;
   for (uint32_t k = 0; k + 1 < n; k++)
     metrics_.depth_proposed[k]++;
-  if (n == 1) {
-    auto r = token(id, draft_steps > 0);
+  // A terminal single-token window has not executed a draft input at all.
+  // Preserve the ordinary paired submission so its preceding MTP KV is ready
+  // if a caller continues the committed request later.
+  if (n == 1 && draft_steps == 0) {
+    auto r = token(id);
     metrics_.verify_ms += r.total_ms;
     metrics_.windows++;
     metrics_.committed++;
@@ -824,19 +914,28 @@ WindowResult round(uint32_t id, uint32_t limit, bool emit = true) {
                              .count();
     return emit_window({{r.token}, 1}, emit);
   }
+  // A zero-proposal window still verifies one target position. Reuse the
+  // recorded batch command; no rejected suffix exists, so it needs no snapshot.
 
   each_row(n, [&](uint32_t row) {
     stage(inputs[row]);
     append_history(inputs[row]);
   });
   auto *dispatch = static_cast<uint32_t *>(ctl_.mapped) + 16 + 2 * E;
-  dispatch[0] = base >= 512 ? 3 : 24;
+  dispatch[0] = base >= 512 ? 0 : 24;
+  dispatch[3] = base >= 512 ? 2 : 0;
+  dispatch[4] = (std::min(base + n, 2051u) + 31) / 32;
+  dispatch[5] = n;
   dispatch[1] = (std::min(base + n, 2051u) + 31) / 32;
   dispatch[2] = n;
   uint32_t last_count = base + n;
-  dispatch[8] = last_count <= 2051 ? (last_count + 255) / 256 : (last_count / 4 + 8) / 8;
+  dispatch[8] =
+      last_count <= 2051 ? (last_count + 255) / 256 : (last_count / 4 + 8) / 8;
   dispatch[9] = n;
   dispatch[10] = 1;
+  dispatch[12] = last_count > 2051 ? last_count / 4 + 1 : 0;
+  dispatch[13] = n;
+  dispatch[14] = 1;
   position_ = base;
   previous_count_ = saved_count;
   previous_ = saved_history;
@@ -891,8 +990,7 @@ WindowResult round(uint32_t id, uint32_t limit, bool emit = true) {
   if (committed < n) {
     metrics_.rollbacks++;
     metrics_.rollback_ms += execute(restore_cmd_[committed]);
-  } else if (n >
-             1) { // Last residual becomes the seed for the following proposal.
+  } else if (n > 1 || head_host_.buffer) { // Commit the residual/debug head.
     metrics_.rollback_ms += execute(commit_cmd_[committed]);
   }
   position_ = base;
